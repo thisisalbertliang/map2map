@@ -1,12 +1,20 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from map2map.models.styled_conv import ConvStyledBlock, ResStyledBlock
 from map2map.models.narrow import narrow_by
 
 
 class StyledVNet(nn.Module):
-    def __init__(self, style_size, in_chan, out_chan, bypass=None, **kwargs):
+    def __init__(
+        self, 
+        style_size, 
+        in_chan, 
+        out_chan, 
+        bypass=None, 
+        **kwargs
+    ):
         """V-Net like network with styles
 
         See `vnet.VNet`.
@@ -37,6 +45,8 @@ class StyledVNet(nn.Module):
             self.bypass = in_chan == out_chan
         else:
             self.bypass = bypass
+        
+        self.dropout_prob = None
 
     def forward(self, x, s):
         if self.bypass:
@@ -45,26 +55,38 @@ class StyledVNet(nn.Module):
         x = self.conv_l00(x, s)
         y0 = self.conv_l01(x, s)
         x = self.down_l0(y0, s)
+        if self.dropout_prob:
+            x = F.dropout(x, p=self.dropout_prob)
 
         y1 = self.conv_l1(x, s)
         x = self.down_l1(y1, s)
+        if self.dropout_prob:
+            x = F.dropout(x, p=self.dropout_prob)
 
         y2 = self.conv_l2(x, s)
         x = self.down_l2(y2, s)
+        if self.dropout_prob:
+            x = F.dropout(x, p=self.dropout_prob)
 
         x = self.conv_c(x, s)
+        if self.dropout_prob:
+            x = F.dropout(x, p=self.dropout_prob)
 
         x = self.up_r2(x, s)
         y2 = narrow_by(y2, 4)
         x = torch.cat([y2, x], dim=1)
         del y2
         x = self.conv_r2(x, s)
+        if self.dropout_prob:
+            x = F.dropout(x, p=self.dropout_prob)
 
         x = self.up_r1(x, s)
         y1 = narrow_by(y1, 16)
         x = torch.cat([y1, x], dim=1)
         del y1
         x = self.conv_r1(x, s)
+        if self.dropout_prob:
+            x = F.dropout(x, p=self.dropout_prob)
 
         x = self.up_r0(x, s)
         y0 = narrow_by(y0, 40)
@@ -78,3 +100,6 @@ class StyledVNet(nn.Module):
             x += x0
 
         return x
+    
+    def enable_dropout(self, dropout_prob: float):
+        self.dropout_prob = dropout_prob

@@ -25,11 +25,16 @@ def get_args():
         'generate',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    uncertain_parser = subparsers.add_parser(
+        'uncertain',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
 
 
     add_train_args(train_parser)
     add_test_args(test_parser)
     add_generate_args(generate_parser)
+    add_uncertain_args(uncertain_parser)
 
     args = parser.parse_args()
 
@@ -244,6 +249,36 @@ def add_generate_args(parser):
     parser.add_argument('--num-threads', type=int,
             help='number of CPU threads when cuda is unavailable. '
             'Default is the number of CPUs on the node by slurm')
+
+
+def add_uncertain_args(parser):
+    add_test_args(parser)
+
+    parser.add_argument(
+        '--sample-size',
+        dest='sample_size',
+        type=int,
+        default=5,
+        help="Number of outputs to sample from each input, if using the Monte Carlo Dropout uncertainty estimation algorithm"
+    )
+    parser.add_argument(
+        '--dropout-prob',
+        dest='dropout_prob',
+        type=float,
+        default=0.9,
+        help="Probability of an element to be zeroed, if using the Monte Carlo Dropout uncertainty estimation algorithm. Default: 0.9"
+    )
+    parser.add_argument(
+        '--square-cb',
+        dest='square_cb',
+        action='store_true',
+        default=False,
+        help=(
+            "Use the SquareCB algorithm to estimate uncertainty. "
+            "Defaults to False, in which case the Monte Carlo Dropout "
+            "algorithm would be used to estimate the uncertainty instead."
+        )
+    )
 
 
 def str_list(s):

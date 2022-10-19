@@ -2,6 +2,7 @@ from .args import get_args
 from . import train
 from . import test
 from . import generate
+from . import uncertain
 
 
 def main():
@@ -14,6 +15,8 @@ def main():
         test.test(args)
     elif args.mode == 'generate':
         generate.generate(args)
+    elif args.mode == "uncertain":
+        uncertain.estimate_uncertainty(args)
 
 if __name__ == '__main__':
     main()
