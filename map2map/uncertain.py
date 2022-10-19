@@ -1,4 +1,5 @@
 import argparse
+from math import sqrt
 from pprint import pprint
 import sys
 import torch
@@ -48,7 +49,7 @@ def estimate_uncertainty(args: argparse.ArgumentParser):
     )
     test_loader = DataLoader(
         test_dataset,
-        batch_size=args.batch_size,
+        batch_size=1,
         shuffle=False,
         num_workers=args.loader_workers,
         pin_memory=True,
@@ -137,4 +138,62 @@ def square_cb(
     loader: DataLoader,
     device: torch.device
 ):
-    pass
+    model.eval()
+
+    logger = SummaryWriter()
+
+    mse_loss = nn.MSELoss()
+    with torch.no_grad():
+        losses = []
+        min_i, min_loss = None, float('inf')
+
+        for i, data in enumerate(loader):
+            style, input, target = data['style'], data['input'], data['target']
+            style = style.to(device, non_blocking=True)
+            input = input.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
+
+            output = model(input, style)
+            _, lag_out, lag_tgt = narrow_cast(input, output, target)
+            _, P_lag_out, _ = power(lag_out)
+            _, P_lag_tgt, _ = power(lag_tgt)
+
+            loss = mse_loss(P_lag_out, P_lag_tgt).cpu().item()
+            if loss < min_loss:
+                min_i, min_loss = i, loss
+
+            losses.append(loss)
+
+            logger.add_text(
+                tag="SquareCB",
+                text_string=f"Field {i}: Power Spectrum MSE Loss: {loss}",
+                global_step=i
+            )
+    
+    mu = len(loader.dataset)
+    gamma = sqrt(mu)
+    # diffs = [loss - min_loss for i, loss in enumerate(losses) if i != min_i]
+    # total_diff = sum(diffs)
+    # normal_diff = [diff / total_diff for diff in diffs]
+    probs = [
+        1 / (mu + gamma * (loss - min_loss))
+        for i, loss in enumerate(losses)
+        if i != min_i
+    ]
+    # probs.insert(min_i, 1 - sum(probs))
+    # total = sum(probs)
+    # probs = [p / total for p in probs]
+
+    plt.scatter(
+        x=[i for i in range(len(loader.dataset) - 1)],
+        y=probs
+    )
+    plt.xlabel("Field (Ordinal)")
+    plt.ylabel("SquareCB Weights")
+    plt.title(f"SquareCB Weights v.s. Field (Ordinal)")
+    fig = plt.gcf()
+
+    logger.add_figure(f"fig/square-cb-weights-vs-field-ordinal", fig)
+    logger.flush()
+
+    logger.close()
