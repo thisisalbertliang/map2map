@@ -3,6 +3,7 @@ from . import train
 from . import test
 from . import generate
 from . import uncertain
+from . import active
 
 
 def main():
@@ -17,6 +18,8 @@ def main():
         generate.generate(args)
     elif args.mode == "uncertain":
         uncertain.estimate_uncertainty(args)
+    elif args.mode == "active":
+        active.search(args)
 
 if __name__ == '__main__':
     main()

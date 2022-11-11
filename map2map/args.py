@@ -29,12 +29,17 @@ def get_args():
         'uncertain',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    active_parser = subparsers.add_parser(
+        'active',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
 
 
     add_train_args(train_parser)
     add_test_args(test_parser)
     add_generate_args(generate_parser)
     add_uncertain_args(uncertain_parser)
+    add_active_args(active_parser)
 
     args = parser.parse_args()
 
@@ -259,14 +264,14 @@ def add_uncertain_args(parser):
         dest='sample_size',
         type=int,
         default=5,
-        help="Number of outputs to sample from each input, if using the Monte Carlo Dropout uncertainty estimation algorithm"
+        help="The sample size used in estimating the uncertainty of the model's output. Only used for the Monte Carlo Dropout uncertainty estimation algorithm."
     )
     parser.add_argument(
         '--dropout-prob',
         dest='dropout_prob',
         type=float,
-        default=0.9,
-        help="Probability of an element to be zeroed, if using the Monte Carlo Dropout uncertainty estimation algorithm. Default: 0.9"
+        default=0.5,
+        help="Probability of an element to be zeroed. Only used for the Monte Carlo Dropout uncertainty estimation algorithm. Default: 0.9"
     )
     parser.add_argument(
         '--square-cb',
@@ -278,6 +283,76 @@ def add_uncertain_args(parser):
             "Defaults to False, in which case the Monte Carlo Dropout "
             "algorithm would be used to estimate the uncertainty instead."
         )
+    )
+
+
+def add_active_args(parser: argparse.ArgumentParser):
+    add_test_args(parser)
+
+    parser.add_argument(
+        '--uncertain-sample-size',
+        dest='uncertain_sample_size',
+        type=int,
+        default=5,
+        help="The sample size used in estimating the uncertainty of the model's output. Only used for the Monte Carlo Dropout uncertainty estimation algorithm."
+    )
+    parser.add_argument(
+        '--report-top-k',
+        dest='report_top_k',
+        type=int,
+        default=5,
+        help="Report the error and uncertainty for the top K inputs in each iteration"
+    )
+    parser.add_argument(
+        '--dropout-prob',
+        dest='dropout_prob',
+        type=float,
+        default=0.5,
+        help="Probability of an element to be zeroed. Only used for the Monte Carlo Dropout uncertainty estimation algorithm"
+    )
+    parser.add_argument(
+        '--path-to-observed-target',
+        dest='path_to_observed_target',
+        type=str,
+        help="File path to the observed displacement field that we are trying to compute the ZA inputs for"
+    )
+    parser.add_argument(
+        '--epochs',
+        dest='epochs',
+        type=int,
+        default=1_000
+    )
+    parser.add_argument(
+        '--lr',
+        type=float,
+        required=True,
+        help='initial learning rate'
+    )
+    parser.add_argument(
+        '--optimizer',
+        default='Adam', 
+        type=str,
+        help='optimization algorithm'
+    )
+    parser.add_argument(
+        '--optimizer-args',
+        default='{}',
+        type=json.loads,
+        help='optimizer arguments in addition to the learning rate, '
+            'e.g. --optimizer-args \'{"betas": [0.5, 0.9]}\''
+    )
+    parser.add_argument(
+        '--square-cb',
+        action='store_true',
+        default=False,
+        help='If true, the best input for each epoch of the active learning loop is selected using the SquareCB weights. If false, UCB is used.'
+    )
+    parser.add_argument(
+        '--load-limit',
+        dest='load_limit',
+        type=int, 
+        default=10,
+        help="Each epoch will only iterate over X inputs."
     )
 
 

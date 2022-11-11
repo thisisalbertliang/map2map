@@ -12,6 +12,7 @@ from tqdm import tqdm
 from math import sqrt
 import numpy as np
 from itertools import islice
+import matplotlib.pyplot as plt
 
 from map2map import models
 from map2map.models import StyledVNet, lag2eul
@@ -70,7 +71,7 @@ def get_test_data(args: argparse.Namespace):
     
     test_loader = DataLoader(
         test_dataset,
-        batch_size=1,
+        batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.loader_workers,
         pin_memory=True,
@@ -111,9 +112,13 @@ def get_observed_target(args: argparse.Namespace):
     return data['target']
     
 
-def compute_uncertainty(args: argparse.Namespace, model: StyledVNet, input: torch.Tensor, style: torch.Tensor, target: torch.Tensor):
+def compute_uncertainty(
+    args: argparse.Namespace, model: StyledVNet,
+    input: torch.Tensor, style: torch.Tensor, target: torch.Tensor,
+    device: torch.device,
+):
     model.enable_dropout(args.dropout_prob)
-    losses = torch.zeros(size=(args.uncertain_sample_size,), device=input.get_device())
+    losses = torch.zeros(size=(args.uncertain_sample_size,), device=device)
     for s in range(args.uncertain_sample_size):
         output = model(input, style)
         output, target = narrow_cast(output, target)
@@ -124,7 +129,9 @@ def compute_uncertainty(args: argparse.Namespace, model: StyledVNet, input: torc
     return variance
 
 
-def compute_error(model: StyledVNet, input: torch.Tensor, style: torch.Tensor, observed_target: torch.Tensor):
+def compute_error(
+    model: StyledVNet, input: torch.Tensor, style: torch.Tensor, observed_target: torch.Tensor
+):
     model.disable_dropout()
     output = model(input, style)
     
@@ -137,6 +144,7 @@ def find_top_squarecb_input(
     model: StyledVNet,
     test_loader: DataLoader,
     observed_target: torch.Tensor,
+    device: torch.device,
     logger: SummaryWriter,
     epoch: int
 ):
@@ -145,7 +153,7 @@ def find_top_squarecb_input(
     inputs = []
     min_ordinal, min_error = None, float('inf')
     with torch.no_grad():
-        for i, data in tqdm(enumerate(islice(test_loader, args.dataset_size))):
+        for i, data in tqdm(enumerate(islice(test_loader, args.load_limit))):
             style, input, target = data['style'], data['input'], data['target']
             style = style.to(device, non_blocking=True)
             input = input.to(device, non_blocking=True)
@@ -223,14 +231,14 @@ def find_top_ucb_input(
     model: StyledVNet,
     test_loader: DataLoader,
     observed_target: torch.Tensor,
+    device: torch.device,
     logger: SummaryWriter,
     epoch: int
 ):
-    device = observed_target.get_device()
-
     top_k_inputs = MinHeap(capacity=args.report_top_k)
+    model.eval()
     with torch.no_grad():
-        for i, data in tqdm(enumerate(islice(test_loader, args.dataset_size))):
+        for i, data in tqdm(enumerate(islice(test_loader, args.load_limit))):
             style, input, target = data['style'], data['input'], data['target']
             style = style.to(device, non_blocking=True)
             input = input.to(device, non_blocking=True)
@@ -238,7 +246,8 @@ def find_top_ucb_input(
 
             uncertainty = compute_uncertainty(
                 args=args, model=model, input=input,
-                style=style, target=target
+                style=style, target=target,
+                device=device,
             )
             error = compute_error(
                 model=model, input=input, style=style, observed_target=observed_target
@@ -279,7 +288,7 @@ def log_top_k_ucb_inputs(args: argparse.Namespace, logger: SummaryWriter, top_k_
         )
     msg = '\n'.join(msg)
     logger.add_text(
-        tag=f'Top UCB Inputs (Out of {args.dataset_size})',
+        tag=f'Top UCB Inputs (Out of {args.load_limit})',
         text_string=msg,
         global_step=global_step,
     )
@@ -297,31 +306,14 @@ def get_model_and_optimizer(
     )
     model.to(device)
 
-    optimizer = import_attr(args.optimizer, torch.optim, callback_at=args.callback_at)
-    optimizer = optimizer(
-        [
-            {
-                'params': (param for name, param in model.named_parameters()
-                           if 'mlp' in name or 'style' in name),
-                'betas': (0.9, 0.99), 'weight_decay': 1e-4,
-            },
-            {
-                'params': (param for name, param in model.named_parameters()
-                           if 'mlp' not in name and 'style' not in name),
-            },
-        ],
+    optimizer = torch.optim.Adam(
+        params=model.parameters(),
         lr=args.lr,
-        **args.optimizer_args,
     )
 
     state = torch.load(args.load_state, map_location=device)
-
     load_model_state_dict(model, state['model'], strict=args.load_state_strict)
     print('model state at epoch {} loaded from {}'.format(state['epoch'], args.load_state))
-
-    if 'optimizer' in state:
-        optimizer.load_state_dict(state['optimizer'])
-        print('optimizer state at epoch {} loaded from {}'.format(state['epoch'], args.load_state))
 
     del state
 
@@ -344,15 +336,46 @@ def train_step(
     eul_loss = criterion(eul_out, eul_tgt)
     train_loss = lag_loss ** 3 * eul_loss
     
-    optimizer.zero_grad()
-    torch.log(train_loss).backward()
-    optimizer.step()
-    
-    logger.add_text(
-        tag='Train Loss',
-        text_string=f'Train loss on input {top_input["ordinal"]}: {train_loss}',
-        global_step=epoch,
+    if train_loss > 0:
+
+        optimizer.zero_grad()
+        torch.log(train_loss).backward()
+        optimizer.step()
+        
+        logger.add_scalar(
+            tag='Train Loss',
+            scalar_value=train_loss,
+            global_step=epoch
+        )
+        logger.add_scalar(
+            tag='Ordinal of Best Input',
+            scalar_value=top_input['ordinal'],
+            global_step=epoch
+        )
+
+
+def plot_best_error_and_uncertainty(
+    epochs: List[int],
+    best_errors: List[float],
+    best_uncertainties: List[float],
+    logger: SummaryWriter,
+):
+    plt.errorbar(
+        x=epochs,
+        y=best_errors,
+        yerr=best_uncertainties,
+        ls='none',
+        fmt='o'
     )
+    plt.xlabel('Epoch')
+    plt.ylabel('MSE between Output Displacement and Observed Displacement + Uncertainty on Output Displacement')
+    fig = plt.gcf()
+    logger.add_figure(
+        f'fig/best_error_and_uncertainty/epoch_{epochs[-1]}',
+        figure=fig,
+    )
+    logger.flush()
+    plt.clf()
 
 
 def search(args: argparse.Namespace):
@@ -377,18 +400,27 @@ def search(args: argparse.Namespace):
     
     logger = SummaryWriter()
     
-    for epoch in range(1, args.epochs + 1):
-        
+    epochs = []
+    best_errors = []
+    best_uncertainties = []
+    for epoch in range(1, args.epochs + 1):        
         if args.square_cb:
             top_input = find_top_squarecb_input(
                 args=args, model=model, test_loader=test_loader,
-                observed_target=observed_target, logger=logger, epoch=epoch
+                observed_target=observed_target, device=device,
+                logger=logger, epoch=epoch
             )
         else:
             top_input = find_top_ucb_input(
                 args=args, model=model, test_loader=test_loader,
-                observed_target=observed_target, logger=logger, epoch=epoch
+                observed_target=observed_target, device=device,
+                logger=logger, epoch=epoch
             )
+            
+        epochs.append(epoch)
+        best_errors.append(top_input['error'])
+        best_uncertainties.append(top_input['uncertainty'])
+        plot_best_error_and_uncertainty(epochs, best_errors, best_uncertainties, logger)
 
         train_step(
             args, epoch=epoch, top_input=top_input,
