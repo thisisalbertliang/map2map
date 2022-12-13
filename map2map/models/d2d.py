@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 
-from map2map.models.styled_conv import ConvStyledBlock, ResStyledBlock
-from map2map.models.narrow import narrow_by
+from .styled_conv import ConvStyledBlock, ResStyledBlock
+from .narrow import narrow_by
 
 
 class StyledVNet(nn.Module):
