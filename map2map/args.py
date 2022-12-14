@@ -101,6 +101,9 @@ def add_common_args(parser):
     parser.add_argument('--misc-kwargs', default='{}', type=json.loads,
             help='miscellaneous keyword arguments for custom models and '
             'norms. Be careful with name collisions')
+    parser.add_argument(
+            '--experiment-title', default=None, type=str,
+    )
 
 
 def add_train_args(parser):

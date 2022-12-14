@@ -3,6 +3,8 @@ import socket
 import time
 import sys
 from pprint import pprint
+from tqdm import tqdm
+from time import gmtime, strftime
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,15 +12,14 @@ import torch.distributed as dist
 from torch.multiprocessing import spawn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 
 from .data import FieldDataset, DistFieldSampler
 from . import models
-from .models import narrow_cast, resample, lag2eul
-from .utils import import_attr, load_model_state_dict, plt_slices, plt_power
+from .models import narrow_cast, resample, lag2eul, StyledVNet
+from .utils import import_attr, load_model_state_dict, plt_slices, plt_power, get_logger
 
 
-ckpt_link = 'checkpoint.pt'
+ckpt_link = 'albert_d2d_forward.pt'
 
 
 def node_worker(args):
@@ -31,6 +32,7 @@ def node_worker(args):
     args.gpus_per_node = torch.cuda.device_count()
     args.world_size = args.nodes * args.gpus_per_node
 
+    print(f"GPUs per Node = {args.gpus_per_node}")
     node = int(os.environ['SLURM_NODEID'])
 
     if args.gpus_per_node < 1:
@@ -125,9 +127,8 @@ def gpu_worker(local_rank, node, args):
     args.style_size = train_dataset.style_size
     args.in_chan = train_dataset.in_chan
     args.out_chan = train_dataset.tgt_chan
-
-    model = import_attr(args.model, models, callback_at=args.callback_at)
-    model = model(args.style_size, sum(args.in_chan), sum(args.out_chan),
+    
+    model = StyledVNet(args.style_size, sum(args.in_chan), sum(args.out_chan),
                   scale_factor=args.scale_factor, **args.misc_kwargs)
     model.to(device)
     model = DistributedDataParallel(model, device_ids=[device],
@@ -140,7 +141,17 @@ def gpu_worker(local_rank, node, args):
 
     optimizer = import_attr(args.optimizer, optim, callback_at=args.callback_at)
     optimizer = optimizer(
-        model.parameters(),
+        [
+            {
+                'params': (param for name, param in model.named_parameters()
+                           if 'mlp' in name or 'style' in name),
+                'betas': (0.9, 0.99), 'weight_decay': 1e-4,
+            },
+            {
+                'params': (param for name, param in model.named_parameters()
+                           if 'mlp' not in name and 'style' not in name),
+            },
+        ],
         lr=args.lr,
         **args.optimizer_args,
     )
@@ -186,14 +197,16 @@ def gpu_worker(local_rank, node, args):
 
     logger = None
     if rank == 0:
-        logger = SummaryWriter()
+        logger = get_logger(args)
 
     if rank == 0:
         print('pytorch {}'.format(torch.__version__))
         pprint(vars(args))
         sys.stdout.flush()
 
-    for epoch in range(start_epoch, args.epochs):
+    ckpt_dir = f"checkpoints/{args.experiment_title}_{strftime('%Y-%m-%d-%H-%M-%S', gmtime())}"
+    os.makedirs(ckpt_dir, exist_ok=True)
+    for epoch in range(args.epochs):
         train_sampler.set_epoch(epoch)
 
         train_loss = train(epoch, train_loader, model, criterion,
@@ -206,7 +219,7 @@ def gpu_worker(local_rank, node, args):
             #epoch_loss = val_loss
 
         if args.reduce_lr_on_plateau:
-            scheduler.step(epoch_loss[2])
+            scheduler.step(epoch_loss[0] * epoch_loss[1])
 
         if rank == 0:
             logger.flush()
@@ -223,7 +236,7 @@ def gpu_worker(local_rank, node, args):
                 'min_loss': min_loss,
             }
 
-            state_file = 'state_{}.pt'.format(epoch + 1)
+            state_file = f'{ckpt_dir}/state_{epoch + 1}.pt'
             torch.save(state, state_file)
             del state
 
@@ -237,15 +250,13 @@ def gpu_worker(local_rank, node, args):
 def train(epoch, loader, model, criterion,
           optimizer, scheduler, logger, device, args):
     model.train()
-
+    st = time.time()
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     epoch_loss = torch.zeros(3, dtype=torch.float64, device=device)
-
-    for i, data in enumerate(loader):
+    for i, data in tqdm(enumerate(loader)):
         batch = epoch * len(loader) + i + 1
-
         style, input, target = data['style'], data['input'], data['target']
 
         style = style.to(device, non_blocking=True)
@@ -274,7 +285,7 @@ def train(epoch, loader, model, criterion,
 
         lag_loss = criterion(lag_out, lag_tgt)
         eul_loss = criterion(eul_out, eul_tgt)
-        loss = lag_loss * eul_loss
+        loss = lag_loss ** 3 * eul_loss
         epoch_loss[0] += lag_loss.detach()
         epoch_loss[1] += eul_loss.detach()
         epoch_loss[2] += loss.detach()
@@ -296,7 +307,7 @@ def train(epoch, loader, model, criterion,
                                   global_step=batch)
                 logger.add_scalar('loss/batch/train/eul', eul_loss.item(),
                                   global_step=batch)
-                logger.add_scalar('loss/batch/train/lxe', loss.item(),
+                logger.add_scalar('loss/batch/train/lxe', lag_loss.item() * eul_loss.item(),
                                   global_step=batch)
 
                 logger.add_scalar('grad/first', grads[0], global_step=batch)
@@ -309,7 +320,7 @@ def train(epoch, loader, model, criterion,
                           global_step=epoch+1)
         logger.add_scalar('loss/epoch/train/eul', epoch_loss[1],
                           global_step=epoch+1)
-        logger.add_scalar('loss/epoch/train/lxe', epoch_loss[2],
+        logger.add_scalar('loss/epoch/train/lxe', epoch_loss[0] * epoch_loss[1],
                           global_step=epoch+1)
 
         fig = plt_slices(
@@ -327,14 +338,15 @@ def train(epoch, loader, model, criterion,
         logger.add_figure('fig/train/power/lag', fig, global_step=epoch+1)
         fig.clf()
 
-        #fig = plt_power(1.0,
-        #    dis=[input, lag_out, lag_tgt],
-        #    label=['in', 'out', 'tgt'],
-        #    **args.misc_kwargs,
-        #)
-        #logger.add_figure('fig/train/power/eul', fig, global_step=epoch+1)
-        #fig.clf()
+        fig = plt_power(1.0,
+            dis=[input, lag_out, lag_tgt],
+            label=['in', 'out', 'tgt'],
+            **args.misc_kwargs,
+        )
+        logger.add_figure('fig/train/power/eul', fig, global_step=epoch+1)
+        fig.clf()
 
+    print(st, time.time() - st)
     return epoch_loss
 
 
@@ -347,7 +359,7 @@ def validate(epoch, loader, model, criterion, logger, device, args):
     epoch_loss = torch.zeros(3, dtype=torch.float64, device=device)
 
     with torch.no_grad():
-        for data in loader:
+        for data in tqdm(loader):
             style, input, target = data['style'], data['input'], data['target']
 
             style = style.to(device, non_blocking=True)
@@ -366,7 +378,7 @@ def validate(epoch, loader, model, criterion, logger, device, args):
 
             lag_loss = criterion(lag_out, lag_tgt)
             eul_loss = criterion(eul_out, eul_tgt)
-            loss = lag_loss * eul_loss
+            loss = lag_loss ** 3 * eul_loss
             epoch_loss[0] += lag_loss.detach()
             epoch_loss[1] += eul_loss.detach()
             epoch_loss[2] += loss.detach()
@@ -378,7 +390,7 @@ def validate(epoch, loader, model, criterion, logger, device, args):
                           global_step=epoch+1)
         logger.add_scalar('loss/epoch/val/eul', epoch_loss[1],
                           global_step=epoch+1)
-        logger.add_scalar('loss/epoch/val/lxe', epoch_loss[2],
+        logger.add_scalar('loss/epoch/val/lxe', epoch_loss[0] * epoch_loss[1],
                           global_step=epoch+1)
 
         fig = plt_slices(
@@ -396,13 +408,13 @@ def validate(epoch, loader, model, criterion, logger, device, args):
         logger.add_figure('fig/val/power/lag', fig, global_step=epoch+1)
         fig.clf()
 
-        #fig = plt_power(1.0,
-        #    dis=[input, lag_out, lag_tgt],
-        #    label=['in', 'out', 'tgt'],
-        #    **args.misc_kwargs,
-        #)
-        #logger.add_figure('fig/val/power/eul', fig, global_step=epoch+1)
-        #fig.clf()
+        fig = plt_power(1.0,
+            dis=[input, lag_out, lag_tgt],
+            label=['in', 'out', 'tgt'],
+            **args.misc_kwargs,
+        )
+        logger.add_figure('fig/val/power/eul', fig, global_step=epoch+1)
+        fig.clf()
 
     return epoch_loss
 
