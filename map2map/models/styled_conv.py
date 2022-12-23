@@ -16,8 +16,10 @@ class ConvStyledBlock(nn.Module):
     'U': upsampling transposed convolution of kernel size 2 and stride 2
     'D': downsampling convolution of kernel size 2 and stride 2
     """
-    def __init__(self, style_size, in_chan, out_chan=None, mid_chan=None,
-            kernel_size=3, stride=1, seq='CBA'):
+    def __init__(self, style_size, in_chan,
+                 out_chan=None, mid_chan=None,
+                kernel_size=3, stride=1, seq='CBA',
+                dropout_prob=None):
         super().__init__()
 
         if out_chan is None:
@@ -34,6 +36,9 @@ class ConvStyledBlock(nn.Module):
         self.norm_chan = in_chan
         self.idx_conv = 0
         self.num_conv = sum([seq.count(l) for l in ['U', 'D', 'C']])
+        
+        # For Monte Carlo dropout at inference time
+        self.dropout_prob = dropout_prob
 
         layers = [self._get_layer(l) for l in seq]
 
@@ -42,15 +47,21 @@ class ConvStyledBlock(nn.Module):
     def _get_layer(self, l):
         if l == 'U':
             in_chan, out_chan = self._setup_conv()
-            return ConvStyled3d(self.style_size, in_chan, out_chan, 2, stride=2,
-                                resample = 'U')
+            return ConvStyled3d(style_size=self.style_size, in_chan=in_chan, out_chan=out_chan,
+                                kernel_size=2,
+                                dropout_prob=self.dropout_prob,
+                                stride=2, resample = 'U')
         elif l == 'D':
             in_chan, out_chan = self._setup_conv()
-            return ConvStyled3d(self.style_size, in_chan, out_chan, 2, stride=2,
-                                resample = 'D')
+            return ConvStyled3d(style_size=self.style_size, in_chan=in_chan, out_chan=out_chan,
+                                kernel_size=2,
+                                dropout_prob=self.dropout_prob,
+                                stride=2, resample = 'D')
         elif l == 'C':
             in_chan, out_chan = self._setup_conv()
-            return ConvStyled3d(self.style_size, in_chan, out_chan, self.kernel_size,
+            return ConvStyled3d(style_size=self.style_size, in_chan=in_chan, out_chan=out_chan,
+                                kernel_size=self.kernel_size,
+                                dropout_prob=self.dropout_prob,
                                 stride=self.stride)
         elif l == 'B':
             return BatchNormStyled3d(self.norm_chan)
@@ -92,8 +103,10 @@ class ResStyledBlock(ConvStyledBlock):
 
     See `ConvStyledBlock` for `seq` types.
     """
-    def __init__(self, style_size, in_chan, out_chan=None, mid_chan=None,
-                 kernel_size=3, stride=1, seq='CBACBA', last_act=None):
+    def __init__(self, style_size, in_chan,
+                 out_chan=None, mid_chan=None,
+                 kernel_size=3, stride=1, seq='CBACBA', last_act=None,
+                 dropout_prob=None):
         if last_act is None:
             last_act = seq[-1] == 'A'
         elif last_act and seq[-1] != 'A':
@@ -107,7 +120,8 @@ class ResStyledBlock(ConvStyledBlock):
             seq = seq[:-1]
 
         super().__init__(style_size, in_chan, out_chan=out_chan, mid_chan=mid_chan,
-                         kernel_size=kernel_size, stride=stride, seq=seq)
+                         kernel_size=kernel_size, stride=stride, seq=seq, 
+                         dropout_prob=dropout_prob)
 
         if last_act:
             self.act = LeakyReLUStyled()
@@ -117,7 +131,10 @@ class ResStyledBlock(ConvStyledBlock):
         if out_chan is None:
             self.skip = None
         else:
-            self.skip = ConvStyled3d(style_size, in_chan, out_chan, 1)
+            self.skip = ConvStyled3d(
+                style_size=style_size, in_chan=in_chan, out_chan=out_chan, kernel_size=1,
+                dropout_prob=dropout_prob
+            )
 
         if 'U' in seq or 'D' in seq:
             raise NotImplementedError('upsample and downsample layers '

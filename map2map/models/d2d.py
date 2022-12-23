@@ -6,7 +6,7 @@ from .narrow import narrow_by
 
 
 class StyledVNet(nn.Module):
-    def __init__(self, style_size, in_chan, out_chan, bypass=None, **kwargs):
+    def __init__(self, style_size, in_chan, out_chan, dropout_prob, bypass=None, **kwargs):
         """V-Net like network with styles
 
         See `vnet.VNet`.
@@ -15,23 +15,24 @@ class StyledVNet(nn.Module):
 
         # activate non-identity skip connection in residual block
         # by explicitly setting out_chan
-        self.conv_l00 = ResStyledBlock(style_size, in_chan, 64, seq='CACA')
-        self.conv_l01 = ResStyledBlock(style_size, 64, 64, seq='CACA')
-        self.down_l0 = ConvStyledBlock(style_size, 64, seq='DA')
-        self.conv_l1 = ResStyledBlock(style_size, 64, 64, seq='CACA')
-        self.down_l1 = ConvStyledBlock(style_size, 64, seq='DA')
-        self.conv_l2 = ResStyledBlock(style_size, 64, 64, seq='CACA')
-        self.down_l2 = ConvStyledBlock(style_size, 64, seq='DA')
+        self.conv_l00 = ResStyledBlock(style_size=style_size, in_chan=in_chan, out_chan=64,seq='CACA', dropout_prob=dropout_prob)
+        self.conv_l01 = ResStyledBlock(style_size=style_size, in_chan=64, out_chan=64, seq='CACA', dropout_prob=dropout_prob)
+        self.down_l0 = ConvStyledBlock(style_size=style_size, in_chan=64, seq='DA', dropout_prob=dropout_prob)
+        self.conv_l1 = ResStyledBlock(style_size=style_size, in_chan=64, out_chan=64, seq='CACA', dropout_prob=dropout_prob)
+        self.down_l1 = ConvStyledBlock(style_size=style_size, in_chan=64, seq='DA', dropout_prob=dropout_prob)
+        self.conv_l2 = ResStyledBlock(style_size=style_size, in_chan=64, out_chan=64, seq='CACA', dropout_prob=dropout_prob)
+        self.down_l2 = ConvStyledBlock(style_size=style_size, in_chan=64, seq='DA', dropout_prob=dropout_prob)
 
-        self.conv_c = ResStyledBlock(style_size, 64, 64, seq='CACA')
+        self.conv_c = ResStyledBlock(style_size=style_size, in_chan=64, out_chan=64, seq='CACA', dropout_prob=dropout_prob)
 
-        self.up_r2 = ConvStyledBlock(style_size, 64, seq='UA')
-        self.conv_r2 = ResStyledBlock(style_size, 128, 64, seq='CACA')
-        self.up_r1 = ConvStyledBlock(style_size, 64, seq='UA')
-        self.conv_r1 = ResStyledBlock(style_size, 128, 64, seq='CACA')
-        self.up_r0 = ConvStyledBlock(style_size, 64, seq='UA')
-        self.conv_r00 = ResStyledBlock(style_size, 128, 64, seq='CACA')
-        self.conv_r01 = ResStyledBlock(style_size, 64, out_chan, seq='CAC')
+        self.up_r2 = ConvStyledBlock(style_size=style_size, in_chan=64, seq='UA', dropout_prob=dropout_prob)
+        self.conv_r2 = ResStyledBlock(style_size=style_size, in_chan=128, out_chan=64, seq='CACA', dropout_prob=dropout_prob)
+        self.up_r1 = ConvStyledBlock(style_size=style_size, in_chan=64, seq='UA', dropout_prob=dropout_prob)
+        self.conv_r1 = ResStyledBlock(style_size=style_size, in_chan=128, out_chan=64, seq='CACA', dropout_prob=dropout_prob)
+        self.up_r0 = ConvStyledBlock(style_size=style_size, in_chan=64, seq='UA', dropout_prob=dropout_prob)
+        self.conv_r00 = ResStyledBlock(style_size=style_size, in_chan=128, out_chan=64, seq='CACA', dropout_prob=dropout_prob)
+        # As mentioned in the "Dropout as Bayesian Approximation" paper, we do not use dropout in the last layer
+        self.conv_r01 = ResStyledBlock(style_size=style_size, in_chan=64, out_chan=out_chan, seq='CAC', dropout_prob=0.0)
 
         if bypass is None:
             self.bypass = in_chan == out_chan
