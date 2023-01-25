@@ -66,7 +66,7 @@ class FieldDataset(Dataset):
         self.is_read_once = np.full(self.nfile, False)
 
         self.style_col = [0]
-        self.style_size = np.loadtxt(self.style_files[0])[self.style_col].shape[0]
+        self.style_size = np.load(self.style_files[0])[self.style_col].shape[0]
         self.in_chan = [np.load(f, mmap_mode='r').shape[0]
                         for f in self.in_files[0]]
         self.tgt_chan = [np.load(f, mmap_mode='r').shape[0]
@@ -164,7 +164,7 @@ class FieldDataset(Dataset):
             mmap_mode = None
             self.is_read_once[ifile] = True
 
-        style = np.loadtxt(self.style_files[ifile])[self.style_col]
+        style = np.load(self.style_files[ifile])[self.style_col]
         in_fields = [np.load(f, mmap_mode=mmap_mode)
                      for f in self.in_files[ifile]]
         tgt_fields = [np.load(f, mmap_mode=mmap_mode)
