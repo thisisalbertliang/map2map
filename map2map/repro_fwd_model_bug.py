@@ -16,7 +16,6 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from .data.fields import FieldDataset
-from .data.norms.cosmology import dis
 from .models.d2d import StyledVNet
 from .models.lag2eul import lag2eul
 from .utils import plt_power, plt_slices, load_model_state_dict
@@ -124,6 +123,8 @@ if __name__ == "__main__":
         target_path=f"/user_data/ajliang/Nonlinear/val/{cosmology}/4/dis.npy", # TODO: replace with your own path for https://app.globus.org/file-manager?origin_id=9da966a0-58ec-11ed-89dc-ede5bae4f491&origin_path=%2FNonlinear%2FLH0045%2F4%2F
         crop=32,
         in_pad=48,
+        in_norms="cosmology.dis",
+        tgt_norms="cosmology.dis",
         experiment_name=f"fwd-model-bug-{cosmology}", # an arbitrary name for tensorboard purposes
     )
 
@@ -133,6 +134,8 @@ if __name__ == "__main__":
         tgt_patterns=[args.target_path],
         crop=args.crop,
         in_pad=args.in_pad,
+        in_norms=[args.in_norms],
+        tgt_norms=[args.tgt_norms],
     )
     loader = torch.utils.data.DataLoader(
         dataset,
@@ -163,7 +166,6 @@ if __name__ == "__main__":
             Running this line `norms.cosmology.dis(output, undo=True)` below causes `ValueError: math domain error` for me. Since I am not sure if this normalization is needed, I have commented it out.
             @dsjamieson, could you please help me understand what this normalization is for if it's actually needed?
             """
-            # dis(output, undo=True)
 
             lag_out, lag_tgt = output, target
             eul_out, eul_tgt = lag2eul([lag_out, lag_tgt])
