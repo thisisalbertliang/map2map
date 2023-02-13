@@ -105,6 +105,9 @@ def add_common_args(parser):
             '--experiment-title', default=None, type=str,
     )
 
+    # Albert
+    parser.add_argument('--distributed', action='store_true', default=False)
+
 
 def add_train_args(parser):
     add_common_args(parser)

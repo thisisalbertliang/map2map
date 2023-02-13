@@ -341,6 +341,7 @@ def crop(fields, anchor, crop, pad):
         ind.append(i)
     ind = tuple(ind)
 
+    # map each field to the cropped patch
     for i, x in enumerate(fields):
         x = x[ind]
 

@@ -8,7 +8,8 @@ from matplotlib.colors import Normalize, LogNorm, SymLogNorm
 from matplotlib.cm import ScalarMappable
 plt.rc('text', usetex=False)
 
-from ..models import lag2eul, power
+from ..models.lag2eul import lag2eul
+from ..models.power import power
 
 
 def quantize(x):
@@ -123,7 +124,7 @@ def plt_slices(*fields, size=64, title=None, cmap=None, norm=None, **kwargs):
     return fig
 
 
-def plt_power(*fields, dis=None, label=None, **kwargs):
+def plt_power(*fields, dis=None, label=None, title=None, **kwargs):
     """Plot power spectra of fields.
 
     Each field should have batch and channel dimensions followed by spatial
@@ -161,6 +162,8 @@ def plt_power(*fields, dis=None, label=None, **kwargs):
     axes.legend()
     axes.set_xlabel('unnormalized wavenumber')
     axes.set_ylabel('unnormalized power')
+    if title:
+        axes.set_title(title)
 
     fig.tight_layout()
 

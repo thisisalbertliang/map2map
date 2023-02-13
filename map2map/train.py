@@ -15,30 +15,41 @@ from torch.utils.data import DataLoader
 
 from .data import FieldDataset, DistFieldSampler
 from . import models
-from .models import narrow_cast, resample, lag2eul, StyledVNet
+from .models import narrow_cast, resample, StyledVNet
+from .models.lag2eul import lag2eul
 from .utils import import_attr, load_model_state_dict, plt_slices, plt_power, get_logger
 
 
-ckpt_link = 'albert_d2d_forward.pt'
+# ckpt_link = 'albert_d2d_forward.pt'
+# ckpt_link = "in-dist-d2d.pt"
+ckpt_link = "fine-tune-paper-fwd-model-in-dist.pt"
 
 
 def node_worker(args):
-    if 'SLURM_STEP_NUM_NODES' in os.environ:
-        args.nodes = int(os.environ['SLURM_STEP_NUM_NODES'])
-    elif 'SLURM_JOB_NUM_NODES' in os.environ:
-        args.nodes = int(os.environ['SLURM_JOB_NUM_NODES'])
+    if args.distributed:
+        if 'SLURM_STEP_NUM_NODES' in os.environ:
+            args.nodes = int(os.environ['SLURM_STEP_NUM_NODES'])
+        elif 'SLURM_JOB_NUM_NODES' in os.environ:
+            args.nodes = int(os.environ['SLURM_JOB_NUM_NODES'])
+        else:
+            raise KeyError('missing node counts in slurm env')
+        node = int(os.environ['SLURM_NODEID'])
     else:
-        raise KeyError('missing node counts in slurm env')
+        args.nodes = 1
+        node = 0
+
     args.gpus_per_node = torch.cuda.device_count()
     args.world_size = args.nodes * args.gpus_per_node
 
     print(f"GPUs per Node = {args.gpus_per_node}")
-    node = int(os.environ['SLURM_NODEID'])
 
     if args.gpus_per_node < 1:
         raise RuntimeError('GPU not found on node {}'.format(node))
 
-    spawn(gpu_worker, args=(node, args), nprocs=args.gpus_per_node)
+    if args.distributed:
+        spawn(gpu_worker, args=(node, args), nprocs=args.gpus_per_node)
+    else:
+        gpu_worker(0, node, args)
 
 
 def gpu_worker(local_rank, node, args):
@@ -57,7 +68,8 @@ def gpu_worker(local_rank, node, args):
     # good practice to disable cudnn.benchmark if enabling cudnn.deterministic
     #torch.backends.cudnn.deterministic = True
 
-    dist_init(rank, args)
+    if args.distributed:
+        dist_init(rank, args)
 
     train_dataset = FieldDataset(
         style_pattern=args.train_style_pattern,
@@ -79,9 +91,11 @@ def gpu_worker(local_rank, node, args):
         scale_factor=args.scale_factor,
         **args.misc_kwargs,
     )
-    train_sampler = DistFieldSampler(train_dataset, shuffle=True,
-                                     div_data=args.div_data,
-                                     div_shuffle_dist=args.div_shuffle_dist)
+    train_sampler = None
+    if args.distributed:
+        train_sampler = DistFieldSampler(train_dataset, shuffle=True,
+                                        div_data=args.div_data,
+                                        div_shuffle_dist=args.div_shuffle_dist)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -112,9 +126,11 @@ def gpu_worker(local_rank, node, args):
             scale_factor=args.scale_factor,
             **args.misc_kwargs,
         )
-        val_sampler = DistFieldSampler(val_dataset, shuffle=False,
-                                       div_data=args.div_data,
-                                       div_shuffle_dist=args.div_shuffle_dist)
+        val_sampler = None
+        if args.distributed:
+            val_sampler = DistFieldSampler(val_dataset, shuffle=False,
+                                           div_data=args.div_data,
+                                           div_shuffle_dist=args.div_shuffle_dist)
         val_loader = DataLoader(
             val_dataset,
             batch_size=args.batch_size,
@@ -127,12 +143,14 @@ def gpu_worker(local_rank, node, args):
     args.style_size = train_dataset.style_size
     args.in_chan = train_dataset.in_chan
     args.out_chan = train_dataset.tgt_chan
-    
+
     model = StyledVNet(args.style_size, sum(args.in_chan), sum(args.out_chan),
+                  dropout_prob=0.0,
                   scale_factor=args.scale_factor, **args.misc_kwargs)
     model.to(device)
-    model = DistributedDataParallel(model, device_ids=[device],
-            process_group=dist.new_group())
+    if args.distributed:
+        model = DistributedDataParallel(model, device_ids=[device],
+                process_group=dist.new_group())
 
     criterion = import_attr(args.criterion, nn, models,
                             callback_at=args.callback_at)
@@ -172,7 +190,7 @@ def gpu_worker(local_rank, node, args):
 
         start_epoch = state['epoch']
 
-        load_model_state_dict(model.module, state['model'],
+        load_model_state_dict(model, state['model'],
                               strict=args.load_state_strict)
 
         if 'optimizer' in state:
@@ -207,7 +225,8 @@ def gpu_worker(local_rank, node, args):
     ckpt_dir = f"checkpoints/{args.experiment_title}_{strftime('%Y-%m-%d-%H-%M-%S', gmtime())}"
     os.makedirs(ckpt_dir, exist_ok=True)
     for epoch in range(args.epochs):
-        train_sampler.set_epoch(epoch)
+        if args.distributed:
+            train_sampler.set_epoch(epoch)
 
         train_loss = train(epoch, train_loader, model, criterion,
                            optimizer, scheduler, logger, device, args)
@@ -229,7 +248,7 @@ def gpu_worker(local_rank, node, args):
 
             state = {
                 'epoch': epoch + 1,
-                'model': model.module.state_dict(),
+                'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
                 'rng': torch.get_rng_state(),
@@ -244,15 +263,16 @@ def gpu_worker(local_rank, node, args):
             os.symlink(state_file, tmp_link)  # workaround to overwrite
             os.rename(tmp_link, ckpt_link)
 
-    dist.destroy_process_group()
+    if args.distributed:
+        dist.destroy_process_group()
 
 
 def train(epoch, loader, model, criterion,
           optimizer, scheduler, logger, device, args):
     model.train()
     st = time.time()
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    rank = dist.get_rank() if args.distributed else 0
+    world_size = dist.get_world_size() if not args.distributed else 1
 
     epoch_loss = torch.zeros(3, dtype=torch.float64, device=device)
     for i, data in tqdm(enumerate(loader)):
@@ -271,9 +291,9 @@ def train(epoch, loader, model, criterion,
             print('output shape :', output.shape)
             print('target shape :', target.shape)
 
-        if (hasattr(model.module, 'scale_factor')
-                and model.module.scale_factor != 1):
-            input = resample(input, model.module.scale_factor, narrow=False)
+        if (hasattr(model, 'scale_factor')
+                and model.scale_factor != 1):
+            input = resample(input, model.scale_factor, narrow=False)
         input, output, target = narrow_cast(input, output, target)
         if batch <= 5 and rank == 0:
             print('narrowed shape :', output.shape)
@@ -296,9 +316,10 @@ def train(epoch, loader, model, criterion,
         grads = get_grads(model)
 
         if batch % args.log_interval == 0:
-            dist.all_reduce(lag_loss)
-            dist.all_reduce(eul_loss)
-            dist.all_reduce(loss)
+            if args.distributed:
+                dist.all_reduce(lag_loss)
+                dist.all_reduce(eul_loss)
+                dist.all_reduce(loss)
             lag_loss /= world_size
             eul_loss /= world_size
             loss /= world_size
@@ -313,7 +334,8 @@ def train(epoch, loader, model, criterion,
                 logger.add_scalar('grad/first', grads[0], global_step=batch)
                 logger.add_scalar('grad/last', grads[-1], global_step=batch)
 
-    dist.all_reduce(epoch_loss)
+    if args.distributed:
+        dist.all_reduce(epoch_loss)
     epoch_loss /= len(loader) * world_size
     if rank == 0:
         logger.add_scalar('loss/epoch/train/lag', epoch_loss[0],
@@ -353,8 +375,8 @@ def train(epoch, loader, model, criterion,
 def validate(epoch, loader, model, criterion, logger, device, args):
     model.eval()
 
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    rank = dist.get_rank() if args.distributed else 0
+    world_size = dist.get_world_size() if args.distributed else 1
 
     epoch_loss = torch.zeros(3, dtype=torch.float64, device=device)
 
@@ -368,9 +390,9 @@ def validate(epoch, loader, model, criterion, logger, device, args):
 
             output = model(input, style)
 
-            if (hasattr(model.module, 'scale_factor')
-                    and model.module.scale_factor != 1):
-                input = resample(input, model.module.scale_factor, narrow=False)
+            if (hasattr(model, 'scale_factor')
+                    and model.scale_factor != 1):
+                input = resample(input, model.scale_factor, narrow=False)
             input, output, target = narrow_cast(input, output, target)
 
             lag_out, lag_tgt = output, target
@@ -383,7 +405,8 @@ def validate(epoch, loader, model, criterion, logger, device, args):
             epoch_loss[1] += eul_loss.detach()
             epoch_loss[2] += loss.detach()
 
-    dist.all_reduce(epoch_loss)
+    if args.distributed:
+        dist.all_reduce(epoch_loss)
     epoch_loss /= len(loader) * world_size
     if rank == 0:
         logger.add_scalar('loss/epoch/val/lag', epoch_loss[0],
