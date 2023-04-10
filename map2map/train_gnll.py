@@ -2,7 +2,7 @@ import os
 import socket
 import time
 import sys
-from pprint import pprint
+from pprint import pformat
 from tqdm import tqdm
 from time import gmtime, strftime
 import torch
@@ -15,11 +15,14 @@ from torch.utils.data import DataLoader
 
 from .data import FieldDataset, DistFieldSampler
 from . import models
-from .models import narrow_cast, resample, lag2eul, StyledVNet
+from .models import narrow_cast, resample, lag2eul
+from .models.uncertainty_quantification.d2d_uq import StyledVNet
 from .utils import import_attr, load_model_state_dict, plt_slices, plt_power, get_logger
 
+import logging
 
-ckpt_link = 'albert_d2d_forward.pt'
+
+ckpt_link = 'd2d-forward-gnll.pt'
 
 
 def node_worker(args):
@@ -32,7 +35,7 @@ def node_worker(args):
     args.gpus_per_node = torch.cuda.device_count()
     args.world_size = args.nodes * args.gpus_per_node
 
-    print(f"GPUs per Node = {args.gpus_per_node}")
+    logging.info(f"GPUs per Node = {args.gpus_per_node}")
     node = int(os.environ['SLURM_NODEID'])
 
     if args.gpus_per_node < 1:
@@ -160,6 +163,8 @@ def gpu_worker(local_rank, node, args):
 
     if (args.load_state == ckpt_link and not os.path.isfile(ckpt_link)
             or not args.load_state):
+        logging.info('initializing model weights')
+
         if args.init_weight_std is not None:
             model.apply(init_weights)
 
@@ -185,8 +190,8 @@ def gpu_worker(local_rank, node, args):
         if rank == 0:
             min_loss = state['min_loss']
 
-            print('state at epoch {} loaded from {}'.format(
-                state['epoch'], args.load_state), flush=True)
+            logging.info('state at epoch {} loaded from {}'.format(
+                state['epoch'], args.load_state))
 
         del state
 
@@ -200,8 +205,8 @@ def gpu_worker(local_rank, node, args):
         logger = get_logger(args)
 
     if rank == 0:
-        print('pytorch {}'.format(torch.__version__))
-        pprint(vars(args))
+        logging.info('pytorch {}'.format(torch.__version__))
+        logging.info(pformat(vars(args)))
         sys.stdout.flush()
 
     ckpt_dir = f"checkpoints/{args.experiment_title}_{strftime('%Y-%m-%d-%H-%M-%S', gmtime())}"
@@ -254,6 +259,9 @@ def train(epoch, loader, model, criterion,
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
+    # Gaussian Negative Log Likelihood loss
+    gnll = nn.GaussianNLLLoss(reduction='mean')
+
     epoch_loss = torch.zeros(3, dtype=torch.float64, device=device)
     for i, data in tqdm(enumerate(loader)):
         batch = epoch * len(loader) + i + 1
@@ -263,27 +271,28 @@ def train(epoch, loader, model, criterion,
         input = input.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
-        output = model(input, style)
+        mean, var = model(input, style)
         if batch <= 5 and rank == 0:
-            print('##### batch :', batch)
-            print('style shape :', style.shape)
-            print('input shape :', input.shape)
-            print('output shape :', output.shape)
-            print('target shape :', target.shape)
+            logging.info('##### batch :', batch)
+            logging.info('style shape :', style.shape)
+            logging.info('input shape :', input.shape)
+            logging.info('output shape :', mean.shape)
+            logging.info('target shape :', target.shape)
 
         if (hasattr(model.module, 'scale_factor')
                 and model.module.scale_factor != 1):
             input = resample(input, model.module.scale_factor, narrow=False)
-        input, output, target = narrow_cast(input, output, target)
+        input, mean, target, var = narrow_cast(input, mean, target, var)
         if batch <= 5 and rank == 0:
-            print('narrowed shape :', output.shape)
+            logging.info('narrowed shape :', mean.shape)
 
-        lag_out, lag_tgt = output, target
-        eul_out, eul_tgt = lag2eul([lag_out, lag_tgt], **args.misc_kwargs)
+        lag_mean, lag_tgt, lag_var = mean, target, var
+        eul_out, eul_tgt = lag2eul([lag_mean, lag_tgt], **args.misc_kwargs)
         if batch <= 5 and rank == 0:
-            print('Eulerian shape :', eul_out.shape, flush=True)
+            logging.info('Eulerian shape :', eul_out.shape)
 
-        lag_loss = criterion(lag_out, lag_tgt)
+        # lag_loss = criterion(lag_out, lag_tgt)
+        lag_loss = gnll(lag_mean, lag_tgt, lag_var)
         eul_loss = criterion(eul_out, eul_tgt)
         loss = lag_loss ** 3 * eul_loss
         epoch_loss[0] += lag_loss.detach()
@@ -303,7 +312,7 @@ def train(epoch, loader, model, criterion,
             eul_loss /= world_size
             loss /= world_size
             if rank == 0:
-                logger.add_scalar('loss/batch/train/lag', lag_loss.item(),
+                logger.add_scalar('loss/batch/train/lag-gnll', lag_loss.item(),
                                   global_step=batch)
                 logger.add_scalar('loss/batch/train/eul', eul_loss.item(),
                                   global_step=batch)
@@ -316,7 +325,7 @@ def train(epoch, loader, model, criterion,
     dist.all_reduce(epoch_loss)
     epoch_loss /= len(loader) * world_size
     if rank == 0:
-        logger.add_scalar('loss/epoch/train/lag', epoch_loss[0],
+        logger.add_scalar('loss/epoch/train/lag-gnll', epoch_loss[0],
                           global_step=epoch+1)
         logger.add_scalar('loss/epoch/train/eul', epoch_loss[1],
                           global_step=epoch+1)
@@ -324,29 +333,31 @@ def train(epoch, loader, model, criterion,
                           global_step=epoch+1)
 
         fig = plt_slices(
-            input[-1], lag_out[-1], lag_tgt[-1], lag_out[-1] - lag_tgt[-1],
+            input[-1], lag_mean[-1], lag_tgt[-1], lag_mean[-1] - lag_tgt[-1],
                        eul_out[-1], eul_tgt[-1], eul_out[-1] - eul_tgt[-1],
+                       lag_var[-1],
             title=['in', 'lag_out', 'lag_tgt', 'lag_out - lag_tgt',
-                         'eul_out', 'eul_tgt', 'eul_out - eul_tgt'],
+                         'eul_out', 'eul_tgt', 'eul_out - eul_tgt',
+                         'lag_var'],
             **args.misc_kwargs,
         )
         logger.add_figure('fig/train', fig, global_step=epoch+1)
         fig.clf()
 
-        fig = plt_power(input, lag_out, lag_tgt, label=['in', 'out', 'tgt'],
+        fig = plt_power(input, lag_mean, lag_tgt, label=['in', 'out', 'tgt'],
                         **args.misc_kwargs)
         logger.add_figure('fig/train/power/lag', fig, global_step=epoch+1)
         fig.clf()
 
         fig = plt_power(1.0,
-            dis=[input, lag_out, lag_tgt],
+            dis=[input, lag_mean, lag_tgt],
             label=['in', 'out', 'tgt'],
             **args.misc_kwargs,
         )
         logger.add_figure('fig/train/power/eul', fig, global_step=epoch+1)
         fig.clf()
 
-    print(st, time.time() - st)
+    logging.info(st, time.time() - st)
     return epoch_loss
 
 
@@ -358,6 +369,9 @@ def validate(epoch, loader, model, criterion, logger, device, args):
 
     epoch_loss = torch.zeros(3, dtype=torch.float64, device=device)
 
+    # Gaussian Negative Log Likelihood loss
+    gnll = nn.GaussianNLLLoss(reduction='mean')
+
     with torch.no_grad():
         for data in tqdm(loader):
             style, input, target = data['style'], data['input'], data['target']
@@ -366,17 +380,17 @@ def validate(epoch, loader, model, criterion, logger, device, args):
             input = input.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
 
-            output = model(input, style)
+            mean, var = model(input, style)
 
             if (hasattr(model.module, 'scale_factor')
                     and model.module.scale_factor != 1):
                 input = resample(input, model.module.scale_factor, narrow=False)
-            input, output, target = narrow_cast(input, output, target)
+            input, mean, target, var = narrow_cast(input, mean, target, var)
 
-            lag_out, lag_tgt = output, target
+            lag_out, lag_tgt, lag_var = mean, target, var
             eul_out, eul_tgt = lag2eul([lag_out, lag_tgt], **args.misc_kwargs)
 
-            lag_loss = criterion(lag_out, lag_tgt)
+            lag_loss = gnll(lag_out, lag_tgt, lag_var)
             eul_loss = criterion(eul_out, eul_tgt)
             loss = lag_loss ** 3 * eul_loss
             epoch_loss[0] += lag_loss.detach()
@@ -386,7 +400,7 @@ def validate(epoch, loader, model, criterion, logger, device, args):
     dist.all_reduce(epoch_loss)
     epoch_loss /= len(loader) * world_size
     if rank == 0:
-        logger.add_scalar('loss/epoch/val/lag', epoch_loss[0],
+        logger.add_scalar('loss/epoch/val/lag-gnll', epoch_loss[0],
                           global_step=epoch+1)
         logger.add_scalar('loss/epoch/val/eul', epoch_loss[1],
                           global_step=epoch+1)
@@ -396,8 +410,10 @@ def validate(epoch, loader, model, criterion, logger, device, args):
         fig = plt_slices(
             input[-1], lag_out[-1], lag_tgt[-1], lag_out[-1] - lag_tgt[-1],
                        eul_out[-1], eul_tgt[-1], eul_out[-1] - eul_tgt[-1],
+                       lag_var[-1],
             title=['in', 'lag_out', 'lag_tgt', 'lag_out - lag_tgt',
-                         'eul_out', 'eul_tgt', 'eul_out - eul_tgt'],
+                         'eul_out', 'eul_tgt', 'eul_out - eul_tgt',
+                         'lag_var'],
             **args.misc_kwargs,
         )
         logger.add_figure('fig/val', fig, global_step=epoch+1)

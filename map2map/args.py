@@ -3,7 +3,7 @@ import argparse
 import json
 import warnings
 
-from .train import ckpt_link
+from .train_gnll import ckpt_link
 
 
 def get_args():
