@@ -19,7 +19,7 @@ from .models import narrow_cast, resample, lag2eul, StyledVNet
 from .utils import import_attr, load_model_state_dict, plt_slices, plt_power, get_logger
 
 
-ckpt_link = 'd2d_forward_vanilla.pt'
+ckpt_link = 'albert_d2d_forward.pt'
 
 
 def node_worker(args):
@@ -129,7 +129,6 @@ def gpu_worker(local_rank, node, args):
     args.out_chan = train_dataset.tgt_chan
 
     model = StyledVNet(args.style_size, sum(args.in_chan), sum(args.out_chan),
-                       dropout_prob=0.0,
                   scale_factor=args.scale_factor, **args.misc_kwargs)
     model.to(device)
     model = DistributedDataParallel(model, device_ids=[device],
@@ -204,9 +203,9 @@ def gpu_worker(local_rank, node, args):
         print('pytorch {}'.format(torch.__version__))
         pprint(vars(args))
         sys.stdout.flush()
-        ckpt_dir = f"checkpoints/{args.experiment_title}_{strftime('%Y-%m-%d-%H-%M-%S', gmtime())}"
-        os.makedirs(ckpt_dir, exist_ok=True)
 
+    ckpt_dir = f"checkpoints/{args.experiment_title}_{strftime('%Y-%m-%d-%H-%M-%S', gmtime())}"
+    os.makedirs(ckpt_dir, exist_ok=True)
     for epoch in range(args.epochs):
         train_sampler.set_epoch(epoch)
 

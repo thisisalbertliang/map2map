@@ -13,6 +13,10 @@ def get_args():
         description='Transform field(s) to field(s)')
 
     subparsers = parser.add_subparsers(title='modes', dest='mode', required=True)
+    train_gnll_parser = subparsers.add_parser(
+        'train-gnll',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     train_parser = subparsers.add_parser(
         'train',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -26,14 +30,14 @@ def get_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-
+    add_train_args(train_gnll_parser)
     add_train_args(train_parser)
     add_test_args(test_parser)
     add_generate_args(generate_parser)
 
     args = parser.parse_args()
 
-    if args.mode == 'train':
+    if args.mode == 'train' or args.mode == 'train-gnll':
         set_train_args(args)
     elif args.mode == 'test':
         set_test_args(args)
@@ -102,7 +106,7 @@ def add_common_args(parser):
             help='miscellaneous keyword arguments for custom models and '
             'norms. Be careful with name collisions')
     parser.add_argument(
-            '--experiment-title', default=None, type=str,
+            '--experiment-title', required=True, type=str,
     )
 
 
