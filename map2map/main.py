@@ -24,7 +24,7 @@ def setup_logging(args: argparse.Namespace):
         os.path.join('logs', f'{experiment_title}.txt')
     )
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format='%(asctime)s %(levelname)s %(message)s',
         handlers=targets
     )

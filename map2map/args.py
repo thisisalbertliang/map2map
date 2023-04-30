@@ -3,8 +3,6 @@ import argparse
 import json
 import warnings
 
-from .train_gnll import ckpt_link
-
 
 def get_args():
     """Parse arguments and set runtime defaults.
@@ -17,6 +15,8 @@ def get_args():
         'train-gnll',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    train_gnll_parser.add_argument('--gnll-var-eps', type=float, default=1e-6)
+
     train_parser = subparsers.add_parser(
         'train',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -81,7 +81,7 @@ def add_common_args(parser):
             help='(generator) model')
     parser.add_argument('--criterion', default='MSELoss', type=str,
             help='loss function')
-    parser.add_argument('--load-state', default=ckpt_link, type=str,
+    parser.add_argument('--load-state', default=None, type=str,
             help='path to load the states of model, optimizer, rng, etc. '
             'Default is the checkpoint. '
             'Start from scratch in case of empty string or missing checkpoint')
@@ -107,6 +107,9 @@ def add_common_args(parser):
             'norms. Be careful with name collisions')
     parser.add_argument(
             '--experiment-title', required=True, type=str,
+    )
+    parser.add_argument(
+            '--distributed', action='store_true', default=False,
     )
 
 
@@ -176,6 +179,8 @@ def add_train_args(parser):
             help='interval (batches) between logging training loss')
     parser.add_argument('--detect-anomaly', action='store_true',
             help='enable anomaly detection for the autograd engine')
+
+    parser.add_argument('--dropout-prob', type=float, default=0.0)
 
 
 def add_test_args(parser):

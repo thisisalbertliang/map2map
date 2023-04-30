@@ -7,6 +7,7 @@ from tqdm import tqdm
 from time import gmtime, strftime
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributed as dist
 from torch.multiprocessing import spawn
@@ -17,31 +18,37 @@ from .data import FieldDataset, DistFieldSampler
 from . import models
 from .models import narrow_cast, resample, lag2eul
 from .models.uncertainty_quantification.d2d_uq import StyledVNet
-from .utils import import_attr, load_model_state_dict, plt_slices, plt_power, get_logger
+from .utils import import_attr, load_model_state_dict, plt_slices, plt_power, get_logger, plt_power_with_error_bar
 
 import logging
+import pickle
 
 
 ckpt_link = 'd2d-forward-gnll.pt'
 
 
 def node_worker(args):
-    if 'SLURM_STEP_NUM_NODES' in os.environ:
-        args.nodes = int(os.environ['SLURM_STEP_NUM_NODES'])
-    elif 'SLURM_JOB_NUM_NODES' in os.environ:
-        args.nodes = int(os.environ['SLURM_JOB_NUM_NODES'])
+    if args.distributed:
+        if 'SLURM_STEP_NUM_NODES' in os.environ:
+            args.nodes = int(os.environ['SLURM_STEP_NUM_NODES'])
+        elif 'SLURM_JOB_NUM_NODES' in os.environ:
+            args.nodes = int(os.environ['SLURM_JOB_NUM_NODES'])
+        else:
+            raise KeyError('missing node counts in slurm env')
+        args.gpus_per_node = torch.cuda.device_count()
+        args.world_size = args.nodes * args.gpus_per_node
+
+        logging.info(f"GPUs per Node = {args.gpus_per_node}")
+        node = int(os.environ['SLURM_NODEID'])
+
+        if args.gpus_per_node < 1:
+            raise RuntimeError('GPU not found on node {}'.format(node))
+
+        spawn(gpu_worker, args=(node, args), nprocs=args.gpus_per_node)
     else:
-        raise KeyError('missing node counts in slurm env')
-    args.gpus_per_node = torch.cuda.device_count()
-    args.world_size = args.nodes * args.gpus_per_node
-
-    logging.info(f"GPUs per Node = {args.gpus_per_node}")
-    node = int(os.environ['SLURM_NODEID'])
-
-    if args.gpus_per_node < 1:
-        raise RuntimeError('GPU not found on node {}'.format(node))
-
-    spawn(gpu_worker, args=(node, args), nprocs=args.gpus_per_node)
+        args.gpus_per_node = 1
+        args.world_size = 1
+        gpu_worker(0, 0, args)
 
 
 def gpu_worker(local_rank, node, args):
@@ -60,7 +67,8 @@ def gpu_worker(local_rank, node, args):
     # good practice to disable cudnn.benchmark if enabling cudnn.deterministic
     #torch.backends.cudnn.deterministic = True
 
-    dist_init(rank, args)
+    if args.distributed:
+        dist_init(rank, args)
 
     train_dataset = FieldDataset(
         style_pattern=args.train_style_pattern,
@@ -82,9 +90,13 @@ def gpu_worker(local_rank, node, args):
         scale_factor=args.scale_factor,
         **args.misc_kwargs,
     )
-    train_sampler = DistFieldSampler(train_dataset, shuffle=True,
+    if args.distributed:
+        train_sampler = DistFieldSampler(train_dataset, shuffle=True,
                                      div_data=args.div_data,
                                      div_shuffle_dist=args.div_shuffle_dist)
+    else:
+        train_sampler = None
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -115,9 +127,13 @@ def gpu_worker(local_rank, node, args):
             scale_factor=args.scale_factor,
             **args.misc_kwargs,
         )
-        val_sampler = DistFieldSampler(val_dataset, shuffle=False,
+        if args.distributed:
+            val_sampler = DistFieldSampler(val_dataset, shuffle=False,
                                        div_data=args.div_data,
                                        div_shuffle_dist=args.div_shuffle_dist)
+        else:
+            val_sampler = None
+
         val_loader = DataLoader(
             val_dataset,
             batch_size=args.batch_size,
@@ -134,7 +150,8 @@ def gpu_worker(local_rank, node, args):
     model = StyledVNet(args.style_size, sum(args.in_chan), sum(args.out_chan),
                   scale_factor=args.scale_factor, **args.misc_kwargs)
     model.to(device)
-    model = DistributedDataParallel(model, device_ids=[device],
+    if args.distributed:
+        model = DistributedDataParallel(model, device_ids=[device],
             process_group=dist.new_group())
 
     criterion = import_attr(args.criterion, nn, models,
@@ -161,8 +178,9 @@ def gpu_worker(local_rank, node, args):
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, **args.scheduler_args)
 
-    if (args.load_state == ckpt_link and not os.path.isfile(ckpt_link)
-            or not args.load_state):
+    # if (args.load_state == ckpt_link and not os.path.isfile(ckpt_link)
+    #         or not args.load_state):
+    if args.load_state is None:
         logging.info('initializing model weights')
 
         if args.init_weight_std is not None:
@@ -177,7 +195,7 @@ def gpu_worker(local_rank, node, args):
 
         start_epoch = state['epoch']
 
-        load_model_state_dict(model.module, state['model'],
+        load_model_state_dict(get_module(model, args), state['model'],
                               strict=args.load_state_strict)
 
         if 'optimizer' in state:
@@ -212,7 +230,8 @@ def gpu_worker(local_rank, node, args):
     ckpt_dir = f"checkpoints/{args.experiment_title}_{strftime('%Y-%m-%d-%H-%M-%S', gmtime())}"
     os.makedirs(ckpt_dir, exist_ok=True)
     for epoch in range(args.epochs):
-        train_sampler.set_epoch(epoch)
+        if args.distributed:
+            train_sampler.set_epoch(epoch)
 
         train_loss = train(epoch, train_loader, model, criterion,
                            optimizer, scheduler, logger, device, args)
@@ -234,7 +253,7 @@ def gpu_worker(local_rank, node, args):
 
             state = {
                 'epoch': epoch + 1,
-                'model': model.module.state_dict(),
+                'model': get_module(model, args).state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
                 'rng': torch.get_rng_state(),
@@ -249,17 +268,17 @@ def gpu_worker(local_rank, node, args):
             os.symlink(state_file, tmp_link)  # workaround to overwrite
             os.rename(tmp_link, ckpt_link)
 
-    dist.destroy_process_group()
+    if args.distributed:
+        dist.destroy_process_group()
 
 
 def train(epoch, loader, model, criterion,
           optimizer, scheduler, logger, device, args):
     model.train()
     st = time.time()
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    rank = dist.get_rank() if args.distributed else 0
+    world_size = dist.get_world_size() if args.distributed else 1
 
-    # Gaussian Negative Log Likelihood loss
     gnll = nn.GaussianNLLLoss(reduction='mean')
 
     epoch_loss = torch.zeros(3, dtype=torch.float64, device=device)
@@ -273,80 +292,141 @@ def train(epoch, loader, model, criterion,
 
         mean, var = model(input, style)
         if batch <= 5 and rank == 0:
-            logging.info('##### batch :', batch)
-            logging.info('style shape :', style.shape)
-            logging.info('input shape :', input.shape)
-            logging.info('output shape :', mean.shape)
-            logging.info('target shape :', target.shape)
+            logging.info(f'##### batch : {batch}')
+            logging.info(f'style shape : {style.shape}')
+            logging.info(f'input shape : {input.shape}')
+            logging.info(f'output shape : {mean.shape}')
+            logging.info(f'target shape : {target.shape}')
 
-        if (hasattr(model.module, 'scale_factor')
-                and model.module.scale_factor != 1):
-            input = resample(input, model.module.scale_factor, narrow=False)
+        if (hasattr(get_module(model, args), 'scale_factor')
+                and get_module(model, args).scale_factor != 1):
+            input = resample(input, get_module(model, args).scale_factor, narrow=False)
         input, mean, target, var = narrow_cast(input, mean, target, var)
         if batch <= 5 and rank == 0:
-            logging.info('narrowed shape :', mean.shape)
+            logging.info(f'narrowed shape : {mean.shape}')
 
         lag_mean, lag_tgt, lag_var = mean, target, var
         eul_out, eul_tgt = lag2eul([lag_mean, lag_tgt], **args.misc_kwargs)
         if batch <= 5 and rank == 0:
-            logging.info('Eulerian shape :', eul_out.shape)
+            logging.info(f'Eulerian shape : {eul_out.shape}')
 
         # lag_loss = criterion(lag_out, lag_tgt)
-        lag_loss = gnll(lag_mean, lag_tgt, lag_var)
-        eul_loss = criterion(eul_out, eul_tgt)
-        loss = lag_loss ** 3 * eul_loss
-        epoch_loss[0] += lag_loss.detach()
-        epoch_loss[1] += eul_loss.detach()
+
+        lag_gnll = gnll(lag_mean, lag_tgt, lag_var)
+
+        # lag_mse = torch.mean(
+        #     F.mse_loss(input=lag_mean, target=lag_tgt, reduction='none') / (lag_var + args.gnll_var_eps)
+        # )
+        # log_lag_mse = torch.log(lag_mse)
+        # lag_var_penalty = torch.log(torch.mean(lag_var))
+
+        # eul_mse = criterion(eul_out, eul_tgt)
+        eul_mse = F.mse_loss(input=eul_out, target=eul_tgt, reduction='mean')
+        # log_eul_loss = torch.log(eul_mse)
+
+        loss = lag_gnll ** 3 * eul_mse
+        # log_loss = log_eul_loss + 3 * (log_lag_mse + lag_var_penalty)
+
+        epoch_loss[0] += lag_gnll.detach()
+        # epoch_loss[0] += lag_mse.detach()
+
+        epoch_loss[1] += eul_mse.detach()
+
         epoch_loss[2] += loss.detach()
+        # epoch_loss[2] += log_loss.detach()
 
         optimizer.zero_grad()
         torch.log(loss).backward()  # NOTE actual loss is log(loss)
+        # log_loss.backward()
         optimizer.step()
         grads = get_grads(model)
 
+        mean_var = torch.mean(var)
+        logging.info(f"[***] mean_var: {mean_var}")
+
         if batch % args.log_interval == 0:
-            dist.all_reduce(lag_loss)
-            dist.all_reduce(eul_loss)
-            dist.all_reduce(loss)
-            lag_loss /= world_size
-            eul_loss /= world_size
+            if args.distributed:
+                # dist.all_reduce(lag_mse)
+                dist.all_reduce(lag_gnll)
+                dist.all_reduce(eul_mse)
+                # dist.all_reduce(log_loss)
+                dist.all_reduce(loss)
+            # lag_mse /= world_size
+            lag_gnll /= world_size
+            eul_mse /= world_size
+            # log_loss /= world_size
             loss /= world_size
             if rank == 0:
-                logger.add_scalar('loss/batch/train/lag-gnll', lag_loss.item(),
+                logger.add_scalar(
+                                # 'loss/batch/train/lag-mse',
+                                'loss/batch/train/lag-gnll',
+                                #   lag_mse.item(),
+                                    lag_gnll.item(),
                                   global_step=batch)
-                logger.add_scalar('loss/batch/train/eul', eul_loss.item(),
+                logger.add_scalar('loss/batch/train/eul-mse', eul_mse.item(),
                                   global_step=batch)
-                logger.add_scalar('loss/batch/train/lxe', lag_loss.item() * eul_loss.item(),
+                logger.add_scalar(
+                                  'loss/batch/train/log-loss',
+                                #   log_loss.item(),
+                                    loss.item(),
+                                  global_step=batch)
+                logger.add_scalar('loss/batch/train/mean-var', mean_var.item(),
                                   global_step=batch)
 
                 logger.add_scalar('grad/first', grads[0], global_step=batch)
                 logger.add_scalar('grad/last', grads[-1], global_step=batch)
 
-    dist.all_reduce(epoch_loss)
+    if args.distributed:
+        dist.all_reduce(epoch_loss)
     epoch_loss /= len(loader) * world_size
     if rank == 0:
-        logger.add_scalar('loss/epoch/train/lag-gnll', epoch_loss[0],
+        logger.add_scalar(
+                        # 'loss/epoch/train/lag-mse',
+                        'loss/epoch/train/lag-gnll',
+                        epoch_loss[0],
                           global_step=epoch+1)
-        logger.add_scalar('loss/epoch/train/eul', epoch_loss[1],
+        logger.add_scalar('loss/epoch/train/eul-mse', epoch_loss[1],
                           global_step=epoch+1)
-        logger.add_scalar('loss/epoch/train/lxe', epoch_loss[0] * epoch_loss[1],
+        logger.add_scalar('loss/epoch/train/log-loss', epoch_loss[2],
                           global_step=epoch+1)
 
-        fig = plt_slices(
-            input[-1], lag_mean[-1], lag_tgt[-1], lag_mean[-1] - lag_tgt[-1],
-                       eul_out[-1], eul_tgt[-1], eul_out[-1] - eul_tgt[-1],
-                       lag_var[-1],
-            title=['in', 'lag_out', 'lag_tgt', 'lag_out - lag_tgt',
-                         'eul_out', 'eul_tgt', 'eul_out - eul_tgt',
-                         'lag_var'],
-            **args.misc_kwargs,
+        try:
+            fig = plt_slices(
+                input[-1], lag_mean[-1], lag_tgt[-1], lag_mean[-1] - lag_tgt[-1],
+                        eul_out[-1], eul_tgt[-1], eul_out[-1] - eul_tgt[-1],
+                        lag_var[-1],
+                title=['in', 'lag_out', 'lag_tgt', 'lag_out - lag_tgt',
+                            'eul_out', 'eul_tgt', 'eul_out - eul_tgt',
+                            'lag_var'],
+                **args.misc_kwargs,
+            )
+            logger.add_figure('fig/train', fig, global_step=epoch+1)
+            fig.clf()
+        except Exception as e:
+            logging.error(e)
+            error_dump_dir = 'error_dump'
+            os.makedirs(error_dump_dir, exist_ok=True)
+            vars = {
+                'input': input,
+                'lag_mean': lag_mean, 'lag_tgt': lag_tgt, 'lag_var': lag_var,
+                'eul_out': eul_out, 'eul_tgt': eul_tgt,
+                'epoch': epoch + 1,
+                'model': get_module(model, args).state_dict(),
+            }
+            error_dump_filename = f'epoch-{epoch+1}-train.pkl'
+            with open(os.path.join(error_dump_dir, error_dump_filename), 'wb') as f:
+                pickle.dump(vars, f)
+
+        # fig = plt_power(input, lag_mean, lag_tgt, label=['in', 'out', 'tgt'],
+        #                 **args.misc_kwargs)
+        fig = plt_power_with_error_bar(
+            {'mean': input, 'var': None},
+            {'mean': lag_mean, 'var': lag_var},
+            {'mean': lag_tgt, 'var': None},
+            label=['in', 'out', 'tgt'],
+            use_pylians=True,
         )
-        logger.add_figure('fig/train', fig, global_step=epoch+1)
-        fig.clf()
-
-        fig = plt_power(input, lag_mean, lag_tgt, label=['in', 'out', 'tgt'],
-                        **args.misc_kwargs)
-        logger.add_figure('fig/train/power/lag', fig, global_step=epoch+1)
+        logger.add_figure('fig/train/power/lag-err-bar', fig, global_step=epoch+1)
         fig.clf()
 
         fig = plt_power(1.0,
@@ -364,12 +444,11 @@ def train(epoch, loader, model, criterion,
 def validate(epoch, loader, model, criterion, logger, device, args):
     model.eval()
 
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    rank = dist.get_rank() if args.distributed else 0
+    world_size = dist.get_world_size() if args.distributed else 1
 
     epoch_loss = torch.zeros(3, dtype=torch.float64, device=device)
 
-    # Gaussian Negative Log Likelihood loss
     gnll = nn.GaussianNLLLoss(reduction='mean')
 
     with torch.no_grad():
@@ -382,50 +461,87 @@ def validate(epoch, loader, model, criterion, logger, device, args):
 
             mean, var = model(input, style)
 
-            if (hasattr(model.module, 'scale_factor')
-                    and model.module.scale_factor != 1):
-                input = resample(input, model.module.scale_factor, narrow=False)
+            if (hasattr(get_module(model, args), 'scale_factor')
+                    and get_module(model, args).scale_factor != 1):
+                input = resample(input, get_module(model, args).scale_factor, narrow=False)
             input, mean, target, var = narrow_cast(input, mean, target, var)
 
-            lag_out, lag_tgt, lag_var = mean, target, var
-            eul_out, eul_tgt = lag2eul([lag_out, lag_tgt], **args.misc_kwargs)
+            lag_mean, lag_tgt, lag_var = mean, target, var
+            eul_out, eul_tgt = lag2eul([lag_mean, lag_tgt], **args.misc_kwargs)
 
-            lag_loss = gnll(lag_out, lag_tgt, lag_var)
-            eul_loss = criterion(eul_out, eul_tgt)
-            loss = lag_loss ** 3 * eul_loss
-            epoch_loss[0] += lag_loss.detach()
-            epoch_loss[1] += eul_loss.detach()
+            lag_gnll = gnll(lag_mean, lag_tgt, lag_var)
+            # lag_mse = torch.mean(
+            #     F.mse_loss(input=lag_mean, target=lag_tgt, reduction='none') / (lag_var + args.gnll_var_eps)
+            # )
+            # log_lag_mse = torch.log(lag_mse)
+            # lag_var_penalty = torch.log(torch.mean(lag_var))
+
+            eul_mse = criterion(eul_out, eul_tgt)
+            # log_eul_loss = torch.log(eul_mse)
+
+            loss = lag_gnll ** 3 * eul_mse
+            # log_loss = log_eul_loss + 3 * (log_lag_mse + lag_var_penalty)
+            epoch_loss[0] += lag_gnll.detach()
+            # epoch_loss[0] += lag_mse.detach()
+            epoch_loss[1] += eul_mse.detach()
             epoch_loss[2] += loss.detach()
+            # epoch_loss[2] += log_loss.detach()
 
-    dist.all_reduce(epoch_loss)
+    if args.distributed:
+        dist.all_reduce(epoch_loss)
     epoch_loss /= len(loader) * world_size
     if rank == 0:
-        logger.add_scalar('loss/epoch/val/lag-gnll', epoch_loss[0],
+        logger.add_scalar(
+                        # 'loss/epoch/val/lag-mse',
+                        'loss/epoch/val/lag-gnll',
+                        epoch_loss[0],
                           global_step=epoch+1)
-        logger.add_scalar('loss/epoch/val/eul', epoch_loss[1],
+        logger.add_scalar('loss/epoch/val/eul-mse', epoch_loss[1],
                           global_step=epoch+1)
-        logger.add_scalar('loss/epoch/val/lxe', epoch_loss[0] * epoch_loss[1],
+        logger.add_scalar('loss/epoch/val/log-loss', epoch_loss[2],
                           global_step=epoch+1)
 
-        fig = plt_slices(
-            input[-1], lag_out[-1], lag_tgt[-1], lag_out[-1] - lag_tgt[-1],
-                       eul_out[-1], eul_tgt[-1], eul_out[-1] - eul_tgt[-1],
-                       lag_var[-1],
-            title=['in', 'lag_out', 'lag_tgt', 'lag_out - lag_tgt',
-                         'eul_out', 'eul_tgt', 'eul_out - eul_tgt',
-                         'lag_var'],
-            **args.misc_kwargs,
+        try:
+            fig = plt_slices(
+                input[-1], lag_mean[-1], lag_tgt[-1], lag_mean[-1] - lag_tgt[-1],
+                        eul_out[-1], eul_tgt[-1], eul_out[-1] - eul_tgt[-1],
+                        lag_var[-1],
+                title=['in', 'lag_out', 'lag_tgt', 'lag_out - lag_tgt',
+                            'eul_out', 'eul_tgt', 'eul_out - eul_tgt',
+                            'lag_var'],
+                **args.misc_kwargs,
+            )
+            logger.add_figure('fig/val', fig, global_step=epoch+1)
+            fig.clf()
+        except Exception as e:
+            logging.error(e)
+            error_dump_dir = 'error_dump'
+            os.makedirs(error_dump_dir, exist_ok=True)
+            vars = {
+                'input': input,
+                'lag_out': lag_mean, 'lag_tgt': lag_tgt, 'lag_var': lag_var,
+                'eul_out': eul_out, 'eul_tgt': eul_tgt,
+                'epoch': epoch + 1,
+                'model': get_module(model, args).state_dict(),
+            }
+            error_dump_filename = f'epoch-{epoch+1}-validate.pkl'
+            with open(os.path.join(error_dump_dir, error_dump_filename), 'wb') as f:
+                pickle.dump(vars, f)
+
+        # fig = plt_power(input, lag_mean, lag_tgt, label=['in', 'out', 'tgt'],
+        #                 **args.misc_kwargs)
+        fig = plt_power_with_error_bar(
+            {'mean': input, 'var': None},
+            {'mean': lag_mean, 'var': lag_var},
+            {'mean': lag_tgt, 'var': None},
+            label=['in', 'out', 'tgt'],
+            use_pylians=True,
         )
-        logger.add_figure('fig/val', fig, global_step=epoch+1)
-        fig.clf()
-
-        fig = plt_power(input, lag_out, lag_tgt, label=['in', 'out', 'tgt'],
-                        **args.misc_kwargs)
-        logger.add_figure('fig/val/power/lag', fig, global_step=epoch+1)
+        logger.add_figure('fig/val/power/lag-err-bar', fig, global_step=epoch+1)
         fig.clf()
 
         fig = plt_power(1.0,
-            dis=[input, lag_out, lag_tgt],
+            dis=[input, lag_mean, lag_tgt],
             label=['in', 'out', 'tgt'],
             **args.misc_kwargs,
         )
@@ -495,3 +611,9 @@ def get_grads(model):
     grads = [grads[0], grads[-1]]
     grads = [g.detach().norm() for g in grads]
     return grads
+
+
+def get_module(model, args):
+    if args.distributed:
+        return model.module
+    return model

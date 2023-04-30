@@ -1,3 +1,4 @@
+import pickle
 import os
 import socket
 import time
@@ -129,7 +130,7 @@ def gpu_worker(local_rank, node, args):
     args.out_chan = train_dataset.tgt_chan
 
     model = StyledVNet(args.style_size, sum(args.in_chan), sum(args.out_chan),
-                       dropout_prob=0.0,
+                       dropout_prob=args.dropout_prob,
                   scale_factor=args.scale_factor, **args.misc_kwargs)
     model.to(device)
     model = DistributedDataParallel(model, device_ids=[device],
@@ -324,15 +325,30 @@ def train(epoch, loader, model, criterion,
         logger.add_scalar('loss/epoch/train/lxe', epoch_loss[0] * epoch_loss[1],
                           global_step=epoch+1)
 
-        fig = plt_slices(
-            input[-1], lag_out[-1], lag_tgt[-1], lag_out[-1] - lag_tgt[-1],
-                       eul_out[-1], eul_tgt[-1], eul_out[-1] - eul_tgt[-1],
-            title=['in', 'lag_out', 'lag_tgt', 'lag_out - lag_tgt',
-                         'eul_out', 'eul_tgt', 'eul_out - eul_tgt'],
-            **args.misc_kwargs,
-        )
-        logger.add_figure('fig/train', fig, global_step=epoch+1)
-        fig.clf()
+        try:
+            fig = plt_slices(
+                input[-1], lag_out[-1], lag_tgt[-1], lag_out[-1] - lag_tgt[-1],
+                        eul_out[-1], eul_tgt[-1], eul_out[-1] - eul_tgt[-1],
+                title=['in', 'lag_out', 'lag_tgt', 'lag_out - lag_tgt',
+                            'eul_out', 'eul_tgt', 'eul_out - eul_tgt'],
+                **args.misc_kwargs,
+            )
+            logger.add_figure('fig/train', fig, global_step=epoch+1)
+            fig.clf()
+        except Exception as e:
+            print(e)
+            error_dump_dir = 'error_dump'
+            os.makedirs(error_dump_dir, exist_ok=True)
+            vars = {
+                'input': input,
+                'lag_out': lag_out, 'lag_tgt': lag_tgt,
+                'eul_out': eul_out, 'eul_tgt': eul_tgt,
+                'epoch': epoch + 1,
+                'model': model.module.state_dict(),
+            }
+            error_dump_filename = f'epoch-{epoch+1}-train.pkl'
+            with open(os.path.join(error_dump_dir, error_dump_filename), 'wb') as f:
+                pickle.dump(vars, f)
 
         fig = plt_power(input, lag_out, lag_tgt, label=['in', 'out', 'tgt'],
                         **args.misc_kwargs)
@@ -394,15 +410,30 @@ def validate(epoch, loader, model, criterion, logger, device, args):
         logger.add_scalar('loss/epoch/val/lxe', epoch_loss[0] * epoch_loss[1],
                           global_step=epoch+1)
 
-        fig = plt_slices(
-            input[-1], lag_out[-1], lag_tgt[-1], lag_out[-1] - lag_tgt[-1],
-                       eul_out[-1], eul_tgt[-1], eul_out[-1] - eul_tgt[-1],
-            title=['in', 'lag_out', 'lag_tgt', 'lag_out - lag_tgt',
-                         'eul_out', 'eul_tgt', 'eul_out - eul_tgt'],
-            **args.misc_kwargs,
-        )
-        logger.add_figure('fig/val', fig, global_step=epoch+1)
-        fig.clf()
+        try:
+            fig = plt_slices(
+                input[-1], lag_out[-1], lag_tgt[-1], lag_out[-1] - lag_tgt[-1],
+                        eul_out[-1], eul_tgt[-1], eul_out[-1] - eul_tgt[-1],
+                title=['in', 'lag_out', 'lag_tgt', 'lag_out - lag_tgt',
+                            'eul_out', 'eul_tgt', 'eul_out - eul_tgt'],
+                **args.misc_kwargs,
+            )
+            logger.add_figure('fig/val', fig, global_step=epoch+1)
+            fig.clf()
+        except Exception as e:
+            print(e)
+            error_dump_dir = 'error_dump'
+            os.makedirs(error_dump_dir, exist_ok=True)
+            vars = {
+                'input': input,
+                'lag_out': lag_out, 'lag_tgt': lag_tgt,
+                'eul_out': eul_out, 'eul_tgt': eul_tgt,
+                'epoch': epoch + 1,
+                'model': model.module.state_dict(),
+            }
+            error_dump_filename = f'epoch-{epoch+1}-validate.pkl'
+            with open(os.path.join(error_dump_dir, error_dump_filename), 'wb') as f:
+                pickle.dump(vars, f)
 
         fig = plt_power(input, lag_out, lag_tgt, label=['in', 'out', 'tgt'],
                         **args.misc_kwargs)

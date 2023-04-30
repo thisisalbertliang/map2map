@@ -129,7 +129,7 @@ class ConvStyled3d(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
         else:
             self.register_parameter('bias', None)
-        
+
         # For MC Dropout Uncertainty Estimation during inference time
         self.dropout_prob = dropout_prob
 
@@ -163,8 +163,9 @@ class ConvStyled3d(nn.Module):
         _, _, *DHWout = x.shape
         x = x.reshape(N, Cout, *DHWout)
 
-        # For MC Dropout Uncertainty Estimation during inference time
-        x = F.dropout(x, p=self.dropout_prob, training=not self.training)
+        # # For MC Dropout Uncertainty Estimation during inference time
+        # Dropout during training time
+        x = F.dropout(x, p=self.dropout_prob, training=self.training)
 
         return x
 

@@ -6,6 +6,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize, LogNorm, SymLogNorm
 from matplotlib.cm import ScalarMappable
+from Pk_library import PKL
+
 plt.rc('text', usetex=False)
 
 from ..models import lag2eul, power
@@ -165,3 +167,84 @@ def plt_power(*fields, dis=None, label=None, **kwargs):
     fig.tight_layout()
 
     return fig
+
+
+def plt_power_with_error_bar(*fields, label=None, use_pylians=False, **kwargs):
+    """Plot power spectra of fields with error bars.
+
+    Each field should have batch and channel dimensions followed by spatial
+    dimensions.
+
+    Optionally the field can be transformed by lag2eul first if given `dis`.
+
+    See `map2map.models.power`.
+    """
+    plt.close('all')
+
+    if label is not None:
+        assert len(label) == len(fields)
+    else:
+        label = [None] * len(fields)
+
+    ks, Ps = [], []
+    for field in fields:
+        k, P_mean = get_power(field['mean'], use_pylians=use_pylians)
+        # Compute the error bar
+        if field['var'] is not None:
+            std = torch.sqrt(field['var'])
+            _, P_upper = get_power(field['mean'] + std, use_pylians=use_pylians)
+            _, P_lower = get_power(field['mean'] - std, use_pylians=use_pylians)
+        else:
+            P_upper, P_lower = None, None
+
+        ks.append(k)
+        Ps.append(
+            {
+                'mean': P_mean,
+                'upper': P_upper if P_upper is not None else None,
+                'lower': P_lower if P_lower is not None else None,
+            }
+        )
+
+    # ks = [k.cpu().numpy() for k in ks]
+
+    fig, axes = plt.subplots(figsize=(4.8, 3.6), dpi=150)
+
+    for k, P, l in zip(ks, Ps, label):
+        axes.loglog(k, P['mean'], label=l, alpha=0.7)
+        if P['upper'] is not None and P['lower'] is not None:
+            axes.fill_between(k, P['lower'], P['upper'], alpha=0.2)
+
+    axes.legend()
+    axes.set_xlabel('unnormalized wavenumber')
+    axes.set_ylabel('unnormalized power')
+
+    fig.tight_layout()
+
+    return fig
+
+
+def get_power(field: torch.Tensor, use_pylians: bool = False):
+    """Compute power spectrum of a field.
+
+    The field should have batch and channel dimensions followed by spatial
+    dimensions.
+
+    See `map2map.models.power`.
+    """
+    with torch.no_grad():
+        if use_pylians:
+            field = field[0]    # remove batch dimension
+            field = field.cpu().numpy()
+
+            axis = 0    # 0, 1, 2 for x, y, z respectively
+            box_length = (field.shape[-1] / 512) * 1000     # Mpc/h
+            xpk = PKL.XPk([field[axis]], box_length, 0, (None, None))
+            pow_spec = xpk.Pk[:, 0, 0]
+            wave_num = xpk.k3D
+
+            return wave_num, pow_spec
+        else:
+            k, P, _ = power(field)
+
+            return k.cpu().numpy(), P.cpu().numpy()
