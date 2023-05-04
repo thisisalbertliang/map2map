@@ -3,9 +3,11 @@ import os
 import socket
 import time
 import sys
-from pprint import pprint
+from pprint import pformat
 from tqdm import tqdm
 from time import gmtime, strftime
+import logging
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -14,32 +16,39 @@ from torch.multiprocessing import spawn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 
+from bayesian_torch.models.dnn_to_bnn import dnn_to_bnn, get_kl_loss
+
 from .data import FieldDataset, DistFieldSampler
 from . import models
 from .models import narrow_cast, resample, lag2eul, StyledVNet
-from .utils import import_attr, load_model_state_dict, plt_slices, plt_power, get_logger
+from .utils import import_attr, load_model_state_dict, plt_slices, plt_power, get_logger, RunningStats, plt_power_with_error_bar
 
 
-ckpt_link = 'd2d_forward_vanilla.pt'
+ckpt_link = 'd2d_forward_bnn.pt'
 
 
 def node_worker(args):
-    if 'SLURM_STEP_NUM_NODES' in os.environ:
-        args.nodes = int(os.environ['SLURM_STEP_NUM_NODES'])
-    elif 'SLURM_JOB_NUM_NODES' in os.environ:
-        args.nodes = int(os.environ['SLURM_JOB_NUM_NODES'])
+    if args.distributed:
+        if 'SLURM_STEP_NUM_NODES' in os.environ:
+            args.nodes = int(os.environ['SLURM_STEP_NUM_NODES'])
+        elif 'SLURM_JOB_NUM_NODES' in os.environ:
+            args.nodes = int(os.environ['SLURM_JOB_NUM_NODES'])
+        else:
+            raise KeyError('missing node counts in slurm env')
+        args.gpus_per_node = torch.cuda.device_count()
+        args.world_size = args.nodes * args.gpus_per_node
+
+        logging.info(f"GPUs per Node = {args.gpus_per_node}")
+        node = int(os.environ['SLURM_NODEID'])
+
+        if args.gpus_per_node < 1:
+            raise RuntimeError('GPU not found on node {}'.format(node))
+
+        spawn(gpu_worker, args=(node, args), nprocs=args.gpus_per_node)
     else:
-        raise KeyError('missing node counts in slurm env')
-    args.gpus_per_node = torch.cuda.device_count()
-    args.world_size = args.nodes * args.gpus_per_node
-
-    print(f"GPUs per Node = {args.gpus_per_node}")
-    node = int(os.environ['SLURM_NODEID'])
-
-    if args.gpus_per_node < 1:
-        raise RuntimeError('GPU not found on node {}'.format(node))
-
-    spawn(gpu_worker, args=(node, args), nprocs=args.gpus_per_node)
+        args.gpus_per_node = 1
+        args.world_size = 1
+        gpu_worker(0, 0, args)
 
 
 def gpu_worker(local_rank, node, args):
@@ -58,7 +67,8 @@ def gpu_worker(local_rank, node, args):
     # good practice to disable cudnn.benchmark if enabling cudnn.deterministic
     #torch.backends.cudnn.deterministic = True
 
-    dist_init(rank, args)
+    if args.distributed:
+        dist_init(rank, args)
 
     train_dataset = FieldDataset(
         style_pattern=args.train_style_pattern,
@@ -80,9 +90,13 @@ def gpu_worker(local_rank, node, args):
         scale_factor=args.scale_factor,
         **args.misc_kwargs,
     )
-    train_sampler = DistFieldSampler(train_dataset, shuffle=True,
+    if args.distributed:
+        train_sampler = DistFieldSampler(train_dataset, shuffle=True,
                                      div_data=args.div_data,
                                      div_shuffle_dist=args.div_shuffle_dist)
+    else:
+        train_sampler = None
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -113,9 +127,12 @@ def gpu_worker(local_rank, node, args):
             scale_factor=args.scale_factor,
             **args.misc_kwargs,
         )
-        val_sampler = DistFieldSampler(val_dataset, shuffle=False,
+        if args.distributed:
+            val_sampler = DistFieldSampler(val_dataset, shuffle=False,
                                        div_data=args.div_data,
                                        div_shuffle_dist=args.div_shuffle_dist)
+        else:
+            val_sampler = None
         val_loader = DataLoader(
             val_dataset,
             batch_size=args.batch_size,
@@ -132,6 +149,13 @@ def gpu_worker(local_rank, node, args):
     model = StyledVNet(args.style_size, sum(args.in_chan), sum(args.out_chan),
                        dropout_prob=args.dropout_prob,
                   scale_factor=args.scale_factor, **args.misc_kwargs)
+    dnn_to_bnn(model, bnn_prior_parameters={
+        'prior_mu': args.prior_mu, 'prior_sigma': args.prior_sigma,
+        'posterior_mu_init': args.posterior_mu_init, 'posterior_rho_init': args.posterior_rho_init,
+        'type': args.bnn_type,
+        'moped_enable': args.moped_enable, 'moped_delta': args.moped_delta,
+
+    })
     model.to(device)
     model = DistributedDataParallel(model, device_ids=[device],
             process_group=dist.new_group())
@@ -160,8 +184,9 @@ def gpu_worker(local_rank, node, args):
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, **args.scheduler_args)
 
-    if (args.load_state == ckpt_link and not os.path.isfile(ckpt_link)
-            or not args.load_state):
+    if args.load_state is None:
+        logging.info('initializing model weights')
+
         if args.init_weight_std is not None:
             model.apply(init_weights)
 
@@ -187,8 +212,8 @@ def gpu_worker(local_rank, node, args):
         if rank == 0:
             min_loss = state['min_loss']
 
-            print('state at epoch {} loaded from {}'.format(
-                state['epoch'], args.load_state), flush=True)
+            logging.info('state at epoch {} loaded from {}'.format(
+                state['epoch'], args.load_state))
 
         del state
 
@@ -202,14 +227,15 @@ def gpu_worker(local_rank, node, args):
         logger = get_logger(args)
 
     if rank == 0:
-        print('pytorch {}'.format(torch.__version__))
-        pprint(vars(args))
+        logging.info('pytorch {}'.format(torch.__version__))
+        logging.info(pformat(vars(args)))
         sys.stdout.flush()
         ckpt_dir = f"checkpoints/{args.experiment_title}_{strftime('%Y-%m-%d-%H-%M-%S', gmtime())}"
         os.makedirs(ckpt_dir, exist_ok=True)
 
     for epoch in range(args.epochs):
-        train_sampler.set_epoch(epoch)
+        if args.distributed:
+            train_sampler.set_epoch(epoch)
 
         train_loss = train(epoch, train_loader, model, criterion,
                            optimizer, scheduler, logger, device, args)
@@ -256,7 +282,7 @@ def train(epoch, loader, model, criterion,
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    epoch_loss = torch.zeros(3, dtype=torch.float64, device=device)
+    epoch_loss = torch.zeros(4, dtype=torch.float64, device=device)
     for i, data in tqdm(enumerate(loader)):
         batch = epoch * len(loader) + i + 1
         style, input, target = data['style'], data['input'], data['target']
@@ -266,24 +292,25 @@ def train(epoch, loader, model, criterion,
         target = target.to(device, non_blocking=True)
 
         output = model(input, style)
+        kl = get_kl_loss(model); kl /= args.batch_size
         if batch <= 5 and rank == 0:
-            print('##### batch :', batch)
-            print('style shape :', style.shape)
-            print('input shape :', input.shape)
-            print('output shape :', output.shape)
-            print('target shape :', target.shape)
+            logging.info(f'##### batch : {batch}')
+            logging.info(f'style shape : {style.shape}')
+            logging.info(f'input shape : {input.shape}')
+            logging.info(f'output shape : {output.shape}')
+            logging.info(f'target shape : {target.shape}')
 
         if (hasattr(model.module, 'scale_factor')
                 and model.module.scale_factor != 1):
             input = resample(input, model.module.scale_factor, narrow=False)
         input, output, target = narrow_cast(input, output, target)
         if batch <= 5 and rank == 0:
-            print('narrowed shape :', output.shape)
+            logging.info(f'narrowed shape : {output.shape}')
 
         lag_out, lag_tgt = output, target
         eul_out, eul_tgt = lag2eul([lag_out, lag_tgt], **args.misc_kwargs)
         if batch <= 5 and rank == 0:
-            print('Eulerian shape :', eul_out.shape, flush=True)
+            logging.info(f'Eulerian shape : {eul_out.shape}')
 
         lag_loss = criterion(lag_out, lag_tgt)
         eul_loss = criterion(eul_out, eul_tgt)
@@ -291,77 +318,32 @@ def train(epoch, loader, model, criterion,
         epoch_loss[0] += lag_loss.detach()
         epoch_loss[1] += eul_loss.detach()
         epoch_loss[2] += loss.detach()
+        epoch_loss[3] += kl.detach()
 
         optimizer.zero_grad()
-        torch.log(loss).backward()  # NOTE actual loss is log(loss)
+        (torch.log(loss) + kl).backward()  # NOTE actual loss is log(loss) + KL
         optimizer.step()
         grads = get_grads(model)
 
         if batch % args.log_interval == 0:
-            dist.all_reduce(lag_loss)
-            dist.all_reduce(eul_loss)
-            dist.all_reduce(loss)
-            lag_loss /= world_size
-            eul_loss /= world_size
-            loss /= world_size
-            if rank == 0:
-                logger.add_scalar('loss/batch/train/lag', lag_loss.item(),
-                                  global_step=batch)
-                logger.add_scalar('loss/batch/train/eul', eul_loss.item(),
-                                  global_step=batch)
-                logger.add_scalar('loss/batch/train/lxe', lag_loss.item() * eul_loss.item(),
-                                  global_step=batch)
+            log_every_interval(
+                lag_loss=lag_loss, eul_loss=eul_loss, loss=loss, kl=kl,
+                grads=grads,
+                batch=batch, logger=logger, rank=rank, world_size=world_size,
+                tag='train',
+            )
 
-                logger.add_scalar('grad/first', grads[0], global_step=batch)
-                logger.add_scalar('grad/last', grads[-1], global_step=batch)
-
-    dist.all_reduce(epoch_loss)
+    if args.distributed:
+        dist.all_reduce(epoch_loss)
     epoch_loss /= len(loader) * world_size
     if rank == 0:
-        logger.add_scalar('loss/epoch/train/lag', epoch_loss[0],
-                          global_step=epoch+1)
-        logger.add_scalar('loss/epoch/train/eul', epoch_loss[1],
-                          global_step=epoch+1)
-        logger.add_scalar('loss/epoch/train/lxe', epoch_loss[0] * epoch_loss[1],
-                          global_step=epoch+1)
-
-        try:
-            fig = plt_slices(
-                input[-1], lag_out[-1], lag_tgt[-1], lag_out[-1] - lag_tgt[-1],
-                        eul_out[-1], eul_tgt[-1], eul_out[-1] - eul_tgt[-1],
-                title=['in', 'lag_out', 'lag_tgt', 'lag_out - lag_tgt',
-                            'eul_out', 'eul_tgt', 'eul_out - eul_tgt'],
-                **args.misc_kwargs,
-            )
-            logger.add_figure('fig/train', fig, global_step=epoch+1)
-            fig.clf()
-        except Exception as e:
-            print(e)
-            error_dump_dir = 'error_dump'
-            os.makedirs(error_dump_dir, exist_ok=True)
-            vars = {
-                'input': input,
-                'lag_out': lag_out, 'lag_tgt': lag_tgt,
-                'eul_out': eul_out, 'eul_tgt': eul_tgt,
-                'epoch': epoch + 1,
-                'model': model.module.state_dict(),
-            }
-            error_dump_filename = f'epoch-{epoch+1}-train.pkl'
-            with open(os.path.join(error_dump_dir, error_dump_filename), 'wb') as f:
-                pickle.dump(vars, f)
-
-        fig = plt_power(input, lag_out, lag_tgt, label=['in', 'out', 'tgt'],
-                        **args.misc_kwargs)
-        logger.add_figure('fig/train/power/lag', fig, global_step=epoch+1)
-        fig.clf()
-
-        fig = plt_power(1.0,
-            dis=[input, lag_out, lag_tgt],
-            label=['in', 'out', 'tgt'],
-            **args.misc_kwargs,
+        log_every_epoch(
+            args=args,
+            lag_loss=epoch_loss[0], eul_loss=epoch_loss[1], kl=epoch_loss[3],
+            input=input, lag_tgt=lag_tgt, eul_tgt=eul_tgt,
+            model=model,
+            logger=logger, epoch=epoch, tag='train',
         )
-        logger.add_figure('fig/train/power/eul', fig, global_step=epoch+1)
-        fig.clf()
 
     print(st, time.time() - st)
     return epoch_loss
@@ -370,10 +352,10 @@ def train(epoch, loader, model, criterion,
 def validate(epoch, loader, model, criterion, logger, device, args):
     model.eval()
 
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    rank = dist.get_rank() if args.distributed else 0
+    world_size = dist.get_world_size() if args.distributed else 1
 
-    epoch_loss = torch.zeros(3, dtype=torch.float64, device=device)
+    epoch_loss = torch.zeros(4, dtype=torch.float64, device=device)
 
     with torch.no_grad():
         for data in tqdm(loader):
@@ -399,54 +381,19 @@ def validate(epoch, loader, model, criterion, logger, device, args):
             epoch_loss[0] += lag_loss.detach()
             epoch_loss[1] += eul_loss.detach()
             epoch_loss[2] += loss.detach()
+            epoch_loss[3] += get_kl_loss(model).detach()
 
-    dist.all_reduce(epoch_loss)
+    if args.distributed:
+        dist.all_reduce(epoch_loss)
     epoch_loss /= len(loader) * world_size
     if rank == 0:
-        logger.add_scalar('loss/epoch/val/lag', epoch_loss[0],
-                          global_step=epoch+1)
-        logger.add_scalar('loss/epoch/val/eul', epoch_loss[1],
-                          global_step=epoch+1)
-        logger.add_scalar('loss/epoch/val/lxe', epoch_loss[0] * epoch_loss[1],
-                          global_step=epoch+1)
-
-        try:
-            fig = plt_slices(
-                input[-1], lag_out[-1], lag_tgt[-1], lag_out[-1] - lag_tgt[-1],
-                        eul_out[-1], eul_tgt[-1], eul_out[-1] - eul_tgt[-1],
-                title=['in', 'lag_out', 'lag_tgt', 'lag_out - lag_tgt',
-                            'eul_out', 'eul_tgt', 'eul_out - eul_tgt'],
-                **args.misc_kwargs,
-            )
-            logger.add_figure('fig/val', fig, global_step=epoch+1)
-            fig.clf()
-        except Exception as e:
-            print(e)
-            error_dump_dir = 'error_dump'
-            os.makedirs(error_dump_dir, exist_ok=True)
-            vars = {
-                'input': input,
-                'lag_out': lag_out, 'lag_tgt': lag_tgt,
-                'eul_out': eul_out, 'eul_tgt': eul_tgt,
-                'epoch': epoch + 1,
-                'model': model.module.state_dict(),
-            }
-            error_dump_filename = f'epoch-{epoch+1}-validate.pkl'
-            with open(os.path.join(error_dump_dir, error_dump_filename), 'wb') as f:
-                pickle.dump(vars, f)
-
-        fig = plt_power(input, lag_out, lag_tgt, label=['in', 'out', 'tgt'],
-                        **args.misc_kwargs)
-        logger.add_figure('fig/val/power/lag', fig, global_step=epoch+1)
-        fig.clf()
-
-        fig = plt_power(1.0,
-            dis=[input, lag_out, lag_tgt],
-            label=['in', 'out', 'tgt'],
-            **args.misc_kwargs,
+        log_every_epoch(
+            args=args,
+            lag_loss=epoch_loss[0], eul_loss=epoch_loss[1], kl=epoch_loss[3],
+            input=input, lag_tgt=lag_tgt, eul_tgt=eul_tgt,
+            model=model,
+            logger=logger, epoch=epoch, tag='val',
         )
-        logger.add_figure('fig/val/power/eul', fig, global_step=epoch+1)
-        fig.clf()
 
     return epoch_loss
 
@@ -511,3 +458,109 @@ def get_grads(model):
     grads = [grads[0], grads[-1]]
     grads = [g.detach().norm() for g in grads]
     return grads
+
+
+def log_every_epoch(
+    args,
+    lag_loss:float, eul_loss:float, kl: float,
+    input: torch.Tensor, lag_tgt: torch.Tensor, eul_tgt: torch.Tensor,
+    model: torch.nn.parallel.DistributedDataParallel,
+    logger, epoch: int, tag: str,
+):
+    lag_mean, lag_var = compute_mean_var(model, input, sample_size=args.sample_size)
+    eul_mean = lag2eul([lag_mean])[0]
+
+    logger.add_scalar(f'loss/epoch/{tag}/lag', lag_loss,
+                      global_step=epoch+1)
+    logger.add_scalar(f'loss/epoch/{tag}/eul', eul_loss,
+                      global_step=epoch+1)
+    logger.add_scalar(f'loss/epoch/{tag}/lxe', lag_loss * eul_loss,
+                      global_step=epoch+1)
+    logger.add_scalar(f'loss/epoch/{tag}/kl', kl,
+                      global_step=epoch+1)
+
+    try:
+        fig = plt_slices(
+            input[-1], lag_mean[-1], lag_tgt[-1], lag_mean[-1] - lag_tgt[-1],
+                    eul_mean[-1], eul_tgt[-1], eul_mean[-1] - eul_tgt[-1],
+            title=['in', 'lag_mean', 'lag_tgt', 'lag_mean - lag_tgt',
+                        'eul_mean', 'eul_tgt', 'eul_mean - eul_tgt'],
+            **args.misc_kwargs,
+        )
+        logger.add_figure(f'fig/{tag}/slices', fig, global_step=epoch+1)
+        fig.clf()
+    except Exception as e:
+        print(e)
+        error_dump_dir = 'error_dump'
+        os.makedirs(error_dump_dir, exist_ok=True)
+        vars = {
+            'input': input,
+            'lag_mean': lag_mean, 'lag_tgt': lag_tgt,
+            'eul_mean': eul_mean, 'eul_tgt': eul_tgt,
+            'epoch': epoch + 1,
+            'model': model.module.state_dict(),
+        }
+        error_dump_filename = f'epoch-{epoch+1}-train.pkl'
+        with open(os.path.join(error_dump_dir, error_dump_filename), 'wb') as f:
+            pickle.dump(vars, f)
+
+    fig = plt_power_with_error_bar(
+        {'mean': input, 'var': None},
+        {'mean': lag_mean, 'var': lag_var},
+        {'mean': lag_tgt, 'var': None},
+        label=['in', 'lag_mean', 'lag_tgt'],
+        use_pylians=False,
+    )
+    logger.add_figure(f'fig/{tag}/power/lag-err-bar', fig, global_step=epoch+1)
+    fig.clf()
+
+    fig = plt_power(1.0,
+        dis=[input, lag_mean, lag_tgt],
+        label=['in', 'eul_mean', 'eul_tgt'],
+        **args.misc_kwargs,
+    )
+    logger.add_figure(f'fig/{tag}/power/eul', fig, global_step=epoch+1)
+    fig.clf()
+
+
+def log_every_interval(
+    args,
+    lag_loss: torch.Tensor, eul_loss: torch.Tensor, loss: torch.Tensor, kl: torch.Tensor,
+    grads: torch.Tensor,
+    batch: int, logger, rank: int, world_size: int,
+    tag: str,
+):
+    if args.distributed:
+        dist.all_reduce(lag_loss)
+        dist.all_reduce(eul_loss)
+        dist.all_reduce(loss)
+    lag_loss /= world_size
+    eul_loss /= world_size
+    loss /= world_size
+    if rank == 0:
+        logger.add_scalar(f'loss/batch/{tag}/lag', lag_loss.item(),
+                            global_step=batch)
+        logger.add_scalar(f'loss/batch/{tag}/eul', eul_loss.item(),
+                            global_step=batch)
+        logger.add_scalar(f'loss/batch/{tag}/lxe', lag_loss.item() * eul_loss.item(),
+                            global_step=batch)
+        logger.add_scalar(f'loss/batch/{tag}/kl', kl.item(),
+                            global_step=batch)
+
+        logger.add_scalar('grad/first', grads[0], global_step=batch)
+        logger.add_scalar('grad/last', grads[-1], global_step=batch)
+
+
+def compute_mean_var(
+    model: torch.nn.parallel.DistributedDataParallel,
+    input: torch.Tensor,
+    sample_size: int,
+):
+    with torch.no_grad():
+        stats = RunningStats()
+        for _ in range(sample_size):
+            output = model(input)
+            stats.push(output)
+        mean, var = stats.mean(), stats.variance()
+
+    return mean, var

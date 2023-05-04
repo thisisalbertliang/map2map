@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=train-gnll-data-parallel
+#SBATCH --job-name=train-vanilla-data-parallel
 #SBATCH --output=%x-%j.out
 #SBATCH --partition=GPU-shared
 #SBATCH --nodes=1
@@ -37,7 +37,7 @@ DATA_DIR="/ocean/projects/cis230021p/lianga/quijote"
 TRAIN_QUIJOTE_NUMBER="LH1045"
 VAL_QUIJOTE_NUMBER="LH0482"
 
-python m2m.py train-gnll \
+python m2m.py train \
     --train-in-patterns ${DATA_DIR}/${TRAIN_QUIJOTE_NUMBER}/lin.npy \
     --train-style-pattern ${DATA_DIR}/${TRAIN_QUIJOTE_NUMBER}/params.npy \
     --train-tgt-patterns ${DATA_DIR}/${TRAIN_QUIJOTE_NUMBER}/nonlin.npy \
@@ -56,7 +56,8 @@ python m2m.py train-gnll \
     --in-pad 48 \
     --tgt-pad 48 \
     --crop 64 \
-    --experiment-title "train-forward-GNLL-data-paralell"
+    --dropout-prob 0.2 \
+    --experiment-title "train-forward-DROPOUT-data-parallel-tryexcept"
 
         # --load-state "/home/ajliang/search/model_weights/paper_fwd_d2d_weights.pt" \
         # --local \

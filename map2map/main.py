@@ -1,4 +1,5 @@
 from .args import get_args
+from . import train_bnn
 from . import train_gnll
 from . import train
 from . import test
@@ -35,6 +36,8 @@ def main():
     args = get_args()
     setup_logging(args)
 
+    if args.mode == 'train-bnn':
+        train_bnn.node_worker(args)
     if args.mode == 'train-gnll':
         train_gnll.node_worker(args)
     elif args.mode == 'train':

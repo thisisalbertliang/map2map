@@ -11,6 +11,10 @@ def get_args():
         description='Transform field(s) to field(s)')
 
     subparsers = parser.add_subparsers(title='modes', dest='mode', required=True)
+    train_bnn_parser = subparsers.add_parser(
+        'train-bnn',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     train_gnll_parser = subparsers.add_parser(
         'train-gnll',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -30,6 +34,8 @@ def get_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
+    add_train_args(train_bnn_parser)
+    add_bnn_args(train_bnn_parser)
     add_train_args(train_gnll_parser)
     add_train_args(train_parser)
     add_test_args(test_parser)
@@ -37,7 +43,7 @@ def get_args():
 
     args = parser.parse_args()
 
-    if args.mode == 'train' or args.mode == 'train-gnll':
+    if args.mode == 'train' or args.mode == 'train-gnll' or args.mode == 'train-bnn':
         set_train_args(args)
     elif args.mode == 'test':
         set_test_args(args)
@@ -256,6 +262,18 @@ def add_generate_args(parser):
     parser.add_argument('--num-threads', type=int,
             help='number of CPU threads when cuda is unavailable. '
             'Default is the number of CPUs on the node by slurm')
+
+
+def add_bnn_args(parser):
+    parser.add_argument('--prior-mu', type=float, default=0.0)
+    parser.add_argument('--prior-sigma', type=float, default=1.0)
+    parser.add_argument('--posterior-mu-init', type=float, default=0.0)
+    parser.add_argument('--posterior-rho-init', type=float, default=-3.0)
+    parser.add_argument('--bnn-type', type=str, choices=['Reparameterization', 'Flipout'], default='Reparameterization')
+    parser.add_argument('--moped-enable', type=bool, default=False) # True to initialize mu/sigma from the pretrained dnn weights
+    parser.add_argument('--moped-delta', type=float, default=0.5)
+    parser.add_argument('--sample-size', type=int, default=30)
+    return parser
 
 
 def str_list(s):
