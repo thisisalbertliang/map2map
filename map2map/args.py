@@ -3,8 +3,6 @@ import argparse
 import json
 import warnings
 
-from .train import ckpt_link
-
 
 def get_args():
     """Parse arguments and set runtime defaults.
@@ -13,6 +11,20 @@ def get_args():
         description='Transform field(s) to field(s)')
 
     subparsers = parser.add_subparsers(title='modes', dest='mode', required=True)
+    train_backward_parser = subparsers.add_parser(
+        'train-backward',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    train_bnn_parser = subparsers.add_parser(
+        'train-bnn',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    train_gnll_parser = subparsers.add_parser(
+        'train-gnll',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    train_gnll_parser.add_argument('--gnll-var-eps', type=float, default=1e-6)
+
     train_parser = subparsers.add_parser(
         'train',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -21,21 +33,33 @@ def get_args():
         'test',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    generate_parser = subparsers.add_parser(
+        'generate',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
 
+    add_train_args(train_bnn_parser)
+    add_bnn_args(train_bnn_parser)
+    add_train_args(train_gnll_parser)
     add_train_args(train_parser)
+    add_train_args(train_backward_parser)
     add_test_args(test_parser)
+    add_generate_args(generate_parser)
 
     args = parser.parse_args()
 
-    if args.mode == 'train':
+    if args.mode in ['train', 'train-gnll', 'train-bnn', 'train-backward']:
         set_train_args(args)
     elif args.mode == 'test':
         set_test_args(args)
+    elif args.mode == 'generate':
+        set_generate_args(args)
 
     return args
 
 
 def add_common_args(parser):
+    parser.add_argument('--save-interval', type=int, default=1000)
     parser.add_argument('--in-norms', type=str_list, help='comma-sep. list '
             'of input normalization functions')
     parser.add_argument('--tgt-norms', type=str_list, help='comma-sep. list '
@@ -69,7 +93,7 @@ def add_common_args(parser):
             help='(generator) model')
     parser.add_argument('--criterion', default='MSELoss', type=str,
             help='loss function')
-    parser.add_argument('--load-state', default=ckpt_link, type=str,
+    parser.add_argument('--load-state', default=None, type=str,
             help='path to load the states of model, optimizer, rng, etc. '
             'Default is the checkpoint. '
             'Start from scratch in case of empty string or missing checkpoint')
@@ -93,15 +117,25 @@ def add_common_args(parser):
     parser.add_argument('--misc-kwargs', default='{}', type=json.loads,
             help='miscellaneous keyword arguments for custom models and '
             'norms. Be careful with name collisions')
+    parser.add_argument(
+            '--experiment-title', required=True, type=str,
+    )
+    parser.add_argument(
+            '--distributed', action='store_true', default=False,
+    )
 
 
 def add_train_args(parser):
     add_common_args(parser)
 
+    parser.add_argument('--train-style-pattern', type=str, required=True,
+            help='glob pattern for training data styles')
     parser.add_argument('--train-in-patterns', type=str_list, required=True,
             help='comma-sep. list of glob patterns for training input data')
     parser.add_argument('--train-tgt-patterns', type=str_list, required=True,
             help='comma-sep. list of glob patterns for training target data')
+    parser.add_argument('--val-style-pattern', type=str,
+            help='glob pattern for validation data styles')
     parser.add_argument('--val-in-patterns', type=str_list,
             help='comma-sep. list of glob patterns for validation input data')
     parser.add_argument('--val-tgt-patterns', type=str_list,
@@ -184,10 +218,14 @@ def add_train_args(parser):
     parser.add_argument('--detect-anomaly', action='store_true',
             help='enable anomaly detection for the autograd engine')
 
+    parser.add_argument('--dropout-prob', type=float, default=None)
+
 
 def add_test_args(parser):
     add_common_args(parser)
 
+    parser.add_argument('--test-style-pattern', type=str, required=True,
+            help='glob pattern for test data styles')
     parser.add_argument('--test-in-patterns', type=str_list, required=True,
             help='comma-sep. list of glob patterns for test input data')
     parser.add_argument('--test-tgt-patterns', type=str_list, required=True,
@@ -196,6 +234,78 @@ def add_test_args(parser):
     parser.add_argument('--num-threads', type=int,
             help='number of CPU threads when cuda is unavailable. '
             'Default is the number of CPUs on the node by slurm')
+
+def add_generate_args(parser):
+    parser.add_argument('--num_mesh_1d', type=int, required=True,
+            help='Number of particles output is num_mesh_1d**3')
+    parser.add_argument('--power_spectrum', type=str, required=True,
+            help='glob pattern for power spectra')
+    parser.add_argument('--gen-style-pattern', type=str, required=True,
+            help='glob pattern for styles')
+    parser.add_argument('--out_dir', type=str, required=True,
+            help='glob pattern for output directories')
+    parser.add_argument('--redshift', type=str,
+            default=0.0, help='redshift of power spectrum')
+    parser.add_argument('--seed', default=None, type=int,
+            help='seed for random realization')
+    parser.add_argument('--no_dis', action="store_true",
+            help='Flag to generate displacements')
+    parser.add_argument('--no_vel', action="store_true",
+            help='Flag to generate velocities')
+    parser.add_argument('--verbose', action="store_true",
+            help='Flag to print more output')
+
+    # Copied from common arguments, some defaults don't make sense for generating form the default models
+    parser.add_argument('--in-norms', type=str_list, help='comma-sep. list '
+            'of input normalization functions')
+    parser.add_argument('--crop', type=int_tuple,
+            help='size to crop the input and target data. Default is the '
+            'field size. Comma-sep. list of 1 or d integers')
+    parser.add_argument('--crop-start', type=int_tuple,
+            help='starting point of the first crop. Default is the origin. '
+            'Comma-sep. list of 1 or d integers')
+    parser.add_argument('--crop-stop', type=int_tuple,
+            help='stopping point of the last crop. Default is the opposite '
+            'corner to the origin. Comma-sep. list of 1 or d integers')
+    parser.add_argument('--crop-step', type=int_tuple,
+            help='spacing between crops. Default is the crop size. '
+            'Comma-sep. list of 1 or d integers')
+    parser.add_argument('--in-pad', '--pad', default=0, type=int_tuple,
+            help='size to pad the input data beyond the crop size, assuming '
+            'periodic boundary condition. Comma-sep. list of 1, d, or dx2 '
+            'integers, to pad equally along all axes, symmetrically on each, '
+            'or by the specified size on every boundary, respectively')
+    parser.add_argument('--scale-factor', default=1, type=int,
+            help='upsampling factor for super-resolution, in which case '
+            'crop and pad are sizes of the input resolution')
+    parser.add_argument('--batch-size', '--batches', type=int, required=True,
+            help='mini-batch size, per GPU in training or in total in testing')
+    parser.add_argument('--loader-workers', default=8, type=int,
+            help='number of subprocesses per data loader. '
+            '0 to disable multiprocessing')
+    parser.add_argument('--callback-at', type=lambda s: os.path.abspath(s),
+            help='directory of custorm code defining callbacks for models, '
+            'norms, criteria, and optimizers. Disabled if not set. '
+            'This is appended to the default locations, '
+            'thus has the lowest priority')
+    parser.add_argument('--misc-kwargs', default='{}', type=json.loads,
+            help='miscellaneous keyword arguments for custom models and '
+            'norms. Be careful with name collisions')
+    parser.add_argument('--num-threads', type=int,
+            help='number of CPU threads when cuda is unavailable. '
+            'Default is the number of CPUs on the node by slurm')
+
+
+def add_bnn_args(parser):
+    parser.add_argument('--prior-mu', type=float, default=0.0)
+    parser.add_argument('--prior-sigma', type=float, default=1.0)
+    parser.add_argument('--posterior-mu-init', type=float, default=0.0)
+    parser.add_argument('--posterior-rho-init', type=float, default=-3.0)
+    parser.add_argument('--bnn-type', type=str, choices=['Reparameterization', 'Flipout'], default='Reparameterization')
+    parser.add_argument('--moped-enable', type=bool, default=False) # True to initialize mu/sigma from the pretrained dnn weights
+    parser.add_argument('--moped-delta', type=float, default=0.5)
+    parser.add_argument('--sample-size', type=int, default=30)
+    return parser
 
 
 def str_list(s):
@@ -209,6 +319,9 @@ def int_tuple(s):
         return t[0]
     else:
         return t
+
+def set_common_args(args):
+    pass
 
 
 def set_common_args(args):
@@ -234,6 +347,9 @@ def set_train_args(args):
         warnings.warn('Disabling cgan given adversary is disabled',
                       RuntimeWarning)
 
-
+        
 def set_test_args(args):
+    set_common_args(args)
+
+def set_generate_args(args):
     set_common_args(args)

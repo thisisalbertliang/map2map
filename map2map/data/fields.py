@@ -43,18 +43,22 @@ class FieldDataset(Dataset):
     the input for super-resolution, in which case `crop` and `pad` are sizes of
     the input resolution.
     """
-    def __init__(self, in_patterns, tgt_patterns,
+    def __init__(self, style_pattern, in_patterns, tgt_patterns,
                  in_norms=None, tgt_norms=None, callback_at=None,
                  augment=False, aug_shift=None, aug_add=None, aug_mul=None,
                  crop=None, crop_start=None, crop_stop=None, crop_step=None,
                  in_pad=0, tgt_pad=0, scale_factor=1,
                  **kwargs):
+        self.style_files = sorted(glob(style_pattern))
+
         in_file_lists = [sorted(glob(p)) for p in in_patterns]
         self.in_files = list(zip(* in_file_lists))
 
         tgt_file_lists = [sorted(glob(p)) for p in tgt_patterns]
         self.tgt_files = list(zip(* tgt_file_lists))
 
+        if len(self.style_files) != len(self.in_files) != len(self.tgt_files):
+            raise ValueError('number of style, input, and target files do not match')
         if len(self.in_files) != len(self.tgt_files):
             raise ValueError('number of input and target fields do not match')
         self.nfile = len(self.in_files)
@@ -63,6 +67,8 @@ class FieldDataset(Dataset):
             raise FileNotFoundError('file not found for {}'.format(in_patterns))
         self.is_read_once = np.full(self.nfile, False)
 
+        self.style_col = [0]
+        self.style_size = np.load(self.style_files[0])[self.style_col].shape[0]
         self.in_chan = [np.load(f, mmap_mode='r').shape[0]
                         for f in self.in_files[0]]
         self.tgt_chan = [np.load(f, mmap_mode='r').shape[0]
@@ -160,6 +166,7 @@ class FieldDataset(Dataset):
             mmap_mode = None
             self.is_read_once[ifile] = True
 
+        style = np.load(self.style_files[ifile])[self.style_col]
         in_fields = [np.load(f, mmap_mode=mmap_mode)
                      for f in self.in_files[ifile]]
         tgt_fields = [np.load(f, mmap_mode=mmap_mode)
@@ -189,10 +196,13 @@ class FieldDataset(Dataset):
              self.crop[argsort_perm_axes] * self.scale_factor,
              self.tgt_pad[argsort_perm_axes])
 
-        in_fields = [torch.from_numpy(f.astype(np.float32))
-                     for f in in_fields]
-        tgt_fields = [torch.from_numpy(f.astype(np.float32))
-                      for f in tgt_fields]
+        style = torch.from_numpy(style).to(torch.float32)
+        in_fields = [torch.from_numpy(f).to(torch.float32) for f in in_fields]
+        tgt_fields = [torch.from_numpy(f).to(torch.float32) for f in tgt_fields]
+
+        # HACK
+        style -= torch.tensor([0.3])
+        style *= torch.tensor([5.0])
 
         if self.in_norms is not None:
             for norm, x in zip(self.in_norms, in_fields):
@@ -227,6 +237,7 @@ class FieldDataset(Dataset):
                        for file in self.tgt_files[ifile]]
 
         return {
+            'style': style,
             'input': in_fields,
             'target': tgt_fields,
             #'input_relpath': in_relpath,
@@ -254,6 +265,7 @@ class FieldDataset(Dataset):
         if isinstance(patches, torch.Tensor):
             patches = patches.detach().cpu().numpy()
 
+        assert patches.ndim == 2 + self.ndim, 'ndim mismatch'
         if patches.ndim != 2 + self.ndim:
             raise RuntimeError(f'ndim mismatch: {patches.ndim, 2 + self.ndim}')
         if any(self.crop_step > patches.shape[2:]):
@@ -262,6 +274,10 @@ class FieldDataset(Dataset):
         # the batched paths are a list of lists with shape (channel, batch)
         # since pytorch default_collate batches list of strings transposedly
         # therefore we transpose below back to (batch, channel)
+        assert patches.shape[1] == sum(chan), 'number of channels mismatch'
+        assert len(paths) == len(chan), 'number of fields mismatch'
+        paths = list(zip(* paths))
+        assert patches.shape[0] == len(paths), 'batch size mismatch'
         if patches.shape[1] != sum(chan):
             raise RuntimeError('number of channels mismatch: '
                                f'{patches.shape[1], sum(chan)}')
@@ -280,6 +296,15 @@ class FieldDataset(Dataset):
         else:
             self.assembly_line[label] = patches
             self.assembly_line[label + 'path'] = paths
+
+        del patches, paths
+        patches = self.assembly_line[label]
+        paths = self.assembly_line[label + 'path']
+
+        # NOTE anchor positioning assumes sufficient target padding and
+        # symmetric narrowing (more on the right if odd) see `models/narrow.py`
+        narrow = self.crop + self.tgt_pad.sum(axis=1) - patches[0].shape[1:]
+        anchors = self.anchors - self.tgt_pad[:, 0] + narrow // 2
 
         del patches, paths
         patches = self.assembly_line[label]
@@ -311,6 +336,7 @@ class FieldDataset(Dataset):
 
 def fill(field, patch, anchor):
     ndim = len(anchor)
+    assert field.ndim == patch.ndim == 1 + ndim, 'ndim mismatch'
     if not field.ndim == patch.ndim == 1 + ndim:
         raise RuntimeError('ndim mismatch: '
                            f'{field.ndim, patch.ndim, 1 + ndim}')
@@ -328,6 +354,10 @@ def fill(field, patch, anchor):
 
 
 def crop(fields, anchor, crop, pad):
+    assert all(x.shape == fields[0].shape for x in fields), 'shape mismatch'
+    size = fields[0].shape[1:]
+    ndim = len(size)
+    assert ndim == len(anchor) == len(crop) == len(pad), 'ndim mismatch'
     if any(x.shape[1:] != fields[0].shape[1:] for x in fields[1:]):
         raise RuntimeError(f'shape mismatch: {[x.shape[1:] for x in fields]}')
     size = fields[0].shape[1:]
