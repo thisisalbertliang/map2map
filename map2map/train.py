@@ -134,7 +134,7 @@ def gpu_worker(local_rank, node, args):
                   scale_factor=args.scale_factor, **args.misc_kwargs)
     model.to(device)
     model = DistributedDataParallel(model, device_ids=[device],
-            process_group=dist.new_group())
+                                    process_group=dist.new_group())
 
     criterion = import_attr(args.criterion, nn, models,
                             callback_at=args.callback_at)
@@ -256,19 +256,35 @@ def train(epoch, loader, model, criterion,
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    epoch_loss = torch.zeros(3, dtype=torch.float64, device=device)
-    for i, data in tqdm(enumerate(loader)):
-        batch = epoch * len(loader) + i + 1
-        style, input, target = data['style'], data['input'], data['target']
+    if (args.log_interval <= args.adv_r1_reg_interval
+        or args.adv_r1_reg_interval < 1):
+        adv_r1_reg_log_interval = args.log_interval
+    else:
+        adv_r1_reg_log_interval = (
+            args.log_interval // args.adv_r1_reg_interval
+            * args.adv_r1_reg_interval)
 
-        style = style.to(device, non_blocking=True)
+    # loss, loss_adv, adv_loss, adv_loss_fake, adv_loss_real
+    # loss: generator (model) supervised loss
+    # loss_adv: generator (model) adversarial loss
+    # adv_loss: discriminator (adv_model) loss
+    epoch_loss = torch.zeros(5, dtype=torch.float64, device=device)
+    fake = torch.zeros([1], dtype=torch.float32, device=device)
+    real = torch.ones([1], dtype=torch.float32, device=device)
+    adv_real = torch.full([1], args.adv_label_smoothing, dtype=torch.float32,
+            device=device)
+
+    for i, data in enumerate(loader):
+        batch = epoch * len(loader) + i + 1
+
+        input, target = data['input'], data['target']
+
         input = input.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
-        output = model(input, style)
+        output = model(input)
         if batch <= 5 and rank == 0:
             print('##### batch :', batch)
-            print('style shape :', style.shape)
             print('input shape :', input.shape)
             print('output shape :', output.shape)
             print('target shape :', target.shape)

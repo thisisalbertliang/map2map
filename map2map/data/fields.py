@@ -59,6 +59,8 @@ class FieldDataset(Dataset):
 
         if len(self.style_files) != len(self.in_files) != len(self.tgt_files):
             raise ValueError('number of style, input, and target files do not match')
+        if len(self.in_files) != len(self.tgt_files):
+            raise ValueError('number of input and target fields do not match')
         self.nfile = len(self.in_files)
 
         if self.nfile == 0:
@@ -264,6 +266,8 @@ class FieldDataset(Dataset):
             patches = patches.detach().cpu().numpy()
 
         assert patches.ndim == 2 + self.ndim, 'ndim mismatch'
+        if patches.ndim != 2 + self.ndim:
+            raise RuntimeError(f'ndim mismatch: {patches.ndim, 2 + self.ndim}')
         if any(self.crop_step > patches.shape[2:]):
             raise RuntimeError('patch too small to tile')
 
@@ -274,6 +278,16 @@ class FieldDataset(Dataset):
         assert len(paths) == len(chan), 'number of fields mismatch'
         paths = list(zip(* paths))
         assert patches.shape[0] == len(paths), 'batch size mismatch'
+        if patches.shape[1] != sum(chan):
+            raise RuntimeError('number of channels mismatch: '
+                               f'{patches.shape[1], sum(chan)}')
+        if len(paths) != len(chan):
+            raise RuntimeError('number of fields mismatch: '
+                               f'{len(paths), len(chan)}')
+        paths = list(zip(* paths))
+        if patches.shape[0] != len(paths):
+            raise RuntimeError('batch size mismatch: '
+                               f'{patches.shape[0], len(paths)}')
 
         patches = list(patches)
         if label in self.assembly_line:
@@ -282,6 +296,15 @@ class FieldDataset(Dataset):
         else:
             self.assembly_line[label] = patches
             self.assembly_line[label + 'path'] = paths
+
+        del patches, paths
+        patches = self.assembly_line[label]
+        paths = self.assembly_line[label + 'path']
+
+        # NOTE anchor positioning assumes sufficient target padding and
+        # symmetric narrowing (more on the right if odd) see `models/narrow.py`
+        narrow = self.crop + self.tgt_pad.sum(axis=1) - patches[0].shape[1:]
+        anchors = self.anchors - self.tgt_pad[:, 0] + narrow // 2
 
         del patches, paths
         patches = self.assembly_line[label]
@@ -314,6 +337,9 @@ class FieldDataset(Dataset):
 def fill(field, patch, anchor):
     ndim = len(anchor)
     assert field.ndim == patch.ndim == 1 + ndim, 'ndim mismatch'
+    if not field.ndim == patch.ndim == 1 + ndim:
+        raise RuntimeError('ndim mismatch: '
+                           f'{field.ndim, patch.ndim, 1 + ndim}')
 
     ind = [slice(None)]
     for d, (p, a, s) in enumerate(zip(
@@ -332,6 +358,13 @@ def crop(fields, anchor, crop, pad):
     size = fields[0].shape[1:]
     ndim = len(size)
     assert ndim == len(anchor) == len(crop) == len(pad), 'ndim mismatch'
+    if any(x.shape[1:] != fields[0].shape[1:] for x in fields[1:]):
+        raise RuntimeError(f'shape mismatch: {[x.shape[1:] for x in fields]}')
+    size = fields[0].shape[1:]
+    ndim = len(size)
+    if not ndim == len(anchor) == len(crop) == len(pad):
+        raise RuntimeError('ndim mismatch: '
+                           f'{ndim, len(anchor), len(crop), len(pad)}')
 
     ind = [slice(None)]
     for d, (a, c, (p0, p1), s) in enumerate(zip(anchor, crop, pad, size)):
@@ -350,7 +383,8 @@ def crop(fields, anchor, crop, pad):
 
 
 def flip(fields, axes, ndim):
-    assert ndim > 1, 'flipping is ambiguous for 1D scalars/vectors'
+    if ndim == 1:
+        raise RuntimeError('flipping is ambiguous for 1D scalars/vectors')
 
     if axes is None:
         axes = torch.randint(2, (ndim,), dtype=torch.bool)
@@ -369,7 +403,8 @@ def flip(fields, axes, ndim):
 
 
 def perm(fields, axes, ndim):
-    assert ndim > 1, 'permutation is not necessary for 1D fields'
+    if ndim == 1:
+        raise RuntimeError('permutation is not necessary for 1D fields')
 
     if axes is None:
         axes = torch.randperm(ndim)
