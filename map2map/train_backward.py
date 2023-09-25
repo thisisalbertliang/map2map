@@ -165,6 +165,8 @@ def gpu_worker(local_rank, node, args):
         if args.init_weight_std is not None:
             model.apply(init_weights)
 
+        print(f"Training model from scracth with initialized weights (std={args.init_weight_std})")
+
         start_epoch = 0
 
         if rank == 0:
@@ -207,6 +209,7 @@ def gpu_worker(local_rank, node, args):
         sys.stdout.flush()
         ckpt_dir = f"checkpoints/{args.experiment_title}_{strftime('%Y-%m-%d-%H-%M-%S', gmtime())}"
         os.makedirs(ckpt_dir, exist_ok=True)
+        args.ckpt_dir = ckpt_dir
 
     for epoch in range(args.epochs):
         train_sampler.set_epoch(epoch)
@@ -238,7 +241,7 @@ def gpu_worker(local_rank, node, args):
                 'min_loss': min_loss,
             }
 
-            state_file = f'{ckpt_dir}/state_{epoch + 1}.pt'
+            state_file = f'{ckpt_dir}/state_epoch-{epoch + 1}.pt'
             torch.save(state, state_file)
             del state
 
@@ -314,6 +317,19 @@ def train(epoch, loader, model, criterion,
 
                 logger.add_scalar('grad/first', grads[0], global_step=batch)
                 logger.add_scalar('grad/last', grads[-1], global_step=batch)
+
+        if rank == 0 and batch % args.save_interval == 0:
+            state = {
+                'epoch': epoch + 1,
+                'model': model.module.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'rng': torch.get_rng_state(),
+            }
+
+            state_file = f'{args.ckpt_dir}/state_epoch-{epoch + 1}_iter-{batch}.pt'
+            torch.save(state, state_file)
+            del state
 
     dist.all_reduce(epoch_loss)
     epoch_loss /= len(loader) * world_size

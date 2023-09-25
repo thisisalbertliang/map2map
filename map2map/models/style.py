@@ -165,7 +165,8 @@ class ConvStyled3d(nn.Module):
 
         # # For MC Dropout Uncertainty Estimation during inference time
         # Dropout during training time
-        x = F.dropout(x, p=self.dropout_prob, training=True)
+        if self.dropout_prob:
+            x = F.dropout(x, p=self.dropout_prob, training=True)
 
         return x
 

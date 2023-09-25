@@ -1,4 +1,5 @@
 from .args import get_args
+from . import train_backward
 from . import train_bnn
 from . import train_gnll
 from . import train
@@ -36,9 +37,11 @@ def main():
     args = get_args()
     setup_logging(args)
 
-    if args.mode == 'train-bnn':
+    if args.mode == 'train-backward':
+        train_backward.node_worker(args)
+    elif args.mode == 'train-bnn':
         train_bnn.node_worker(args)
-    if args.mode == 'train-gnll':
+    elif args.mode == 'train-gnll':
         train_gnll.node_worker(args)
     elif args.mode == 'train':
         train.node_worker(args)
@@ -46,6 +49,8 @@ def main():
         test.test(args)
     elif args.mode == 'generate':
         generate.generate(args)
+    else:
+        raise ValueError(f'Unknown mode: {args.mode}')
 
 if __name__ == '__main__':
     main()

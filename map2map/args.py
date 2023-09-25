@@ -11,6 +11,10 @@ def get_args():
         description='Transform field(s) to field(s)')
 
     subparsers = parser.add_subparsers(title='modes', dest='mode', required=True)
+    train_backward_parser = subparsers.add_parser(
+        'train-backward',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     train_bnn_parser = subparsers.add_parser(
         'train-bnn',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -38,12 +42,13 @@ def get_args():
     add_bnn_args(train_bnn_parser)
     add_train_args(train_gnll_parser)
     add_train_args(train_parser)
+    add_train_args(train_backward_parser)
     add_test_args(test_parser)
     add_generate_args(generate_parser)
 
     args = parser.parse_args()
 
-    if args.mode == 'train' or args.mode == 'train-gnll' or args.mode == 'train-bnn':
+    if args.mode in ['train', 'train-gnll', 'train-bnn', 'train-backward']:
         set_train_args(args)
     elif args.mode == 'test':
         set_test_args(args)
@@ -54,6 +59,7 @@ def get_args():
 
 
 def add_common_args(parser):
+    parser.add_argument('--save-interval', type=int, default=1000)
     parser.add_argument('--in-norms', type=str_list, help='comma-sep. list '
             'of input normalization functions')
     parser.add_argument('--tgt-norms', type=str_list, help='comma-sep. list '
@@ -186,7 +192,7 @@ def add_train_args(parser):
     parser.add_argument('--detect-anomaly', action='store_true',
             help='enable anomaly detection for the autograd engine')
 
-    parser.add_argument('--dropout-prob', type=float, default=0.0)
+    parser.add_argument('--dropout-prob', type=float, default=None)
 
 
 def add_test_args(parser):
